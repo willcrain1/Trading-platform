@@ -4,6 +4,53 @@ This document specifies the complete auto-trading system implemented in `backend
 
 ---
 
+## Executive Overview
+
+At a high level, this is a **twice-daily, fully automated paper-trading loop**: it scans a watchlist for setups, cross-references congressional trading activity, sizes and files trades against a $20,000 simulated account, has each trade reviewed by an AI risk analyst before it fills, and then manages every open position mechanically until it exits. No human is in the loop for any individual trade decision — the system runs unattended on a schedule and simply logs its reasoning at every step for later review in the Trade Journal.
+
+### The components, and what each one owns
+
+| Component | File(s) | Responsibility |
+|---|---|---|
+| **Data & indicators** | `data/client.py`, `analysis/indicators.py` | Fetches OHLCV bars and quotes; computes RSI, ATR, MACD, SMA/EMA, Bollinger bands, and the derived `compute_signals()` summary (trend, momentum, crosses) that everything downstream reads from. |
+| **Watchlist scanner** | `routers/scan.py` | Runs `compute_signals()` against the watchlist on a schedule, turns the result into an integer **technical score** (§4), and persists it to `scan_history` — the raw material for both the Technical and Sustained signal sources. |
+| **Congress data pipeline** | `data/congress.py`, `routers/congress.py` | Tracks politician trades, computes each politician's historical win rate, rolls that up per-ticker into a **quality tier** (sharp/mixed/weak), and flags **contrarian "smart buy"** tickers where a sharp investor bought against a weak chart. |
+| **Auto-selector** | `trading/auto_selector.py` | The orchestration brain, run at 10:05/16:05 ET. Gathers candidates from all three signal sources (§3), ranks them, sizes positions by ATR-based risk (§7), balances allocation between the Smart Buy and Technical/Sustained buckets, and creates strategy instances. |
+| **Strategy functions** | `analysis/backtest.py` | Pure functions (`ema_cross_9_21`, `rsi_revert`) that turn a bar history into a desired position (long/flat/short) for one instance. |
+| **Analyst (AI risk gate)** | `trading/analyst.py` | A real LLM call (via the local `claude` CLI) that reviews every proposed order — macro context, dealer gamma positioning, portfolio state — and can veto it, shrink its size, or adjust its stop/target within sanity bounds. Fails open (auto-approves) if the CLI is unavailable, so a broken analyst never blocks trading. |
+| **Engine** | `trading/engine.py` | Diffs each instance's desired position against what's actually held, creates and routes orders through the analyst, submits fills to the broker, and opens/closes trade-plan records. |
+| **Mechanical exits** | `trading/exits.py` | A separate, tighter-cadence sweep (every 15 min) that enforces stop-loss/take-profit/time-stop with no analyst involvement — deliberately ungated so risk-reducing exits are never delayed by an AI call. |
+| **Broker** | `trading/broker.py` | The simulated fill engine: instant fills at the latest quote, cash/position bookkeeping, no fees or slippage. Swappable for a real broker via the same interface. |
+| **Scheduler** | `trading/scheduler.py` | Wires all of the above to the clock (§2) — this is the only thing that actually kicks off a cycle; everything else is invoked by it (or manually, via the same entry points). |
+| **Store & reporting** | `trading/store.py`, `routers/paper.py` | SQLite persistence for every order, fill, trade plan, and equity snapshot, plus the Trade Journal's derived stats (win rate, Sharpe, drawdown, annualized return, S&P 500 benchmark — §12). |
+
+### How a trade actually happens, end to end
+
+```mermaid
+flowchart TD
+    A[Scheduler: 10:05 / 16:05 ET] --> B[Watchlist scan\n+ Congress refresh]
+    B --> C{Auto-selector:\ngather candidates}
+    C -->|Technical / Sustained| D[Technical score >= 3\nor 3+ scan streak]
+    C -->|Smart Buy| E[Score <= -1 AND\nsharp politician buying]
+    D --> F[Rank + ATR-size +\nbucket-balance]
+    E --> F
+    F --> G[Engine: diff desired\nvs held position]
+    G --> H[Analyst review:\napprove / veto / resize]
+    H -->|approved| I[Broker: instant fill\nat latest quote]
+    H -->|vetoed| Z[No trade — logged]
+    I --> J[Trade plan opened:\nstop / target / time-stop]
+    J --> K[Mechanical exit sweep\nevery 15 min]
+    J --> L[Engine re-evaluates signal\nat next 10:05/16:05 run]
+    K -->|breach| M[Closed: stop_loss /\ntake_profit / time_stop]
+    L -->|signal flips off,\nanalyst-reviewed| N[Closed: signal_exit]
+    M --> O[Trade Journal:\nstats, Sharpe, drawdown,\nCAGR, S&P benchmark]
+    N --> O
+```
+
+The two signal sources (Technical/Sustained and Smart Buy) feed the same downstream pipeline but represent opposite theses — one follows the chart, the other deliberately bets against it when a historically sharp politician disagrees with it — which is why they're tracked as separate portfolio buckets throughout sizing, execution, and reporting rather than merged into one undifferentiated trade list. Every other part of the pipeline (analyst review, broker fill, exit management) is shared and source-agnostic. The sections below specify each box in this diagram exactly.
+
+---
+
 ## 1. Account Model
 
 - **Starting cash**: $20,000.00 (`STARTING_CASH`).
