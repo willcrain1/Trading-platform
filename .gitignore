@@ -1,0 +1,32 @@
+# ── Secrets / local config ──────────────────────────────────────────────────
+backend/data/app_config.json
+backend/data/broker_config.json
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+
+# ── Runtime data (regenerated locally, not source) ──────────────────────────
+backend/data/*.db
+backend/debug_claude.log
+*.log
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── Node / frontend ──────────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

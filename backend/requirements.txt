@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+yfinance>=0.2.50
+pandas>=2.2
+numpy>=1.26
+scipy>=1.13
+apscheduler>=3.10,<4
+alpaca-py>=0.30
+requests>=2.32
