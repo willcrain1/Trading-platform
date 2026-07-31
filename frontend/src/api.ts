@@ -179,6 +179,7 @@ export interface SelectionSnapshot {
   avgAnnualizedGain: number | null
   maxAnnualizedGain: number | null
   buyCount: number | null
+  hasOptionsActivity?: boolean
   compositeScore: number | null
 }
 
@@ -516,6 +517,11 @@ export interface CongressTrade {
   assetDescription: string
   district: string
   party: string
+  // asset type — options trades are parsed from the filing's free-text comment
+  assetType?: 'stock' | 'option'
+  optionType?: 'call' | 'put' | null
+  strikePrice?: number | null
+  expirationDate?: string | null
   // enriched price & return fields
   priceAtBuy?: number | null
   priceAtDisclosure?: number | null
@@ -561,6 +567,9 @@ export interface CongressTicker {
   investorQualityScore?: number | null
   score?: number | null
   contrarian?: boolean
+  hasOptionsActivity?: boolean
+  optionsBuyCount?: number
+  hasPutActivity?: boolean
   refTxDate?: string
   refDisclosedDate?: string
   enrichError?: string

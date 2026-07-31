@@ -68,6 +68,42 @@ def _annualize(ret: float, days: int) -> float | None:
     return round(max(min(ann, 9999.9), -9999.9), 1)
 
 
+# A disclosed "buy" transaction is only bullish conviction if it's a plain stock
+# purchase or a call option — a put purchase is a bearish bet even though the STOCK
+# Act reports it under the same "buy" transaction type. Conflating the two silently
+# scores a politician's put-buying skill backwards (profits when price falls) and
+# would let bearish activity trigger the Smart Buy bullish contrarian thesis.
+def _is_bullish(tr: dict) -> bool:
+    return tr.get("assetType") != "option" or tr.get("optionType") != "put"
+
+
+# Minimum days between disclosure and an option's expiration for it to still count as
+# an actionable signal — below this, the engine's review/sizing/execution latency
+# likely eats what little runway is left. See STRATEGY_SPEC.md for the empirical
+# basis (real Capitol Trades data: ~15% of disclosed option buys are already expired
+# or within 30 days of expiring by the time they're disclosed).
+MIN_OPTION_RUNWAY_DAYS = 30
+
+
+def _option_runway_days(tr: dict) -> int | None:
+    """Days between disclosure and expiration; None for stock trades or unparseable dates."""
+    if tr.get("assetType") != "option" or not tr.get("expirationDate"):
+        return None
+    disc = _parse_date(tr.get("disclosedDate", ""))
+    exp = _parse_date(tr.get("expirationDate", ""))
+    if not disc or not exp:
+        return None
+    return (exp - disc).days
+
+
+def _is_stale_option(tr: dict) -> bool:
+    """True if an option trade's disclosed-to-expiration runway is too short (or already
+    expired) to still be actionable. Unparseable expirations are treated as not-stale —
+    absence of data shouldn't silently kill a signal we can't evaluate."""
+    runway = _option_runway_days(tr)
+    return runway is not None and runway < MIN_OPTION_RUNWAY_DAYS
+
+
 def _enrich(ticker_data: dict, sells_index: dict | None = None) -> dict:
     """Add price-move columns and per-trade returns for politician scoring.
 
@@ -153,14 +189,18 @@ def _enrich(ticker_data: dict, sells_index: dict | None = None) -> dict:
                             realized = True
 
             if p_buy and p_buy > 0:
+                # A put purchase profits when the underlying falls — invert the raw
+                # stock-price return so "win"/return direction reflects the politician's
+                # actual P&L, not just which way the stock moved. See _is_bullish().
+                direction = -1 if tr.get("optionType") == "put" else 1
                 if realized and p_sell is not None:
                     exit_dt   = _parse_date(sell_date_str)
                     days_held = max((exit_dt - td).days, 1) if (exit_dt and td) else 1
-                    ret       = round((p_sell / p_buy - 1) * 100, 1)
+                    ret       = round((p_sell / p_buy - 1) * 100 * direction, 1)
                     exit_price = p_sell
                 else:
                     days_held  = max((today - td).days, 1) if td else 1
-                    ret        = round((price_now / p_buy - 1) * 100, 1)
+                    ret        = round((price_now / p_buy - 1) * 100 * direction, 1)
                     exit_price = price_now
 
                 trade_returns.append({
@@ -327,8 +367,28 @@ def _build_universe(days: int, min_buys: int, chamber: str) -> dict:
         t["investorQualityScore"] = round(avg_wr, 1) if avg_wr is not None else None
         t["avgAnnualizedGain"]    = avg_ann
         t["maxAnnualizedGain"]    = max_ann  # best individual politician — used for quality gating
+
+        trades = t.get("trades", [])
+        bullish_trades = [tr for tr in trades if _is_bullish(tr)]
+        option_trades  = [tr for tr in trades if tr.get("assetType") == "option"]
+        actionable_call_trades = [
+            tr for tr in option_trades
+            if tr.get("optionType") == "call" and not _is_stale_option(tr)
+        ]
+
         score = t.get("score")
-        t["contrarian"] = (quality == "sharp" and score is not None and score <= -1)
+        # Contrarian requires an actual bullish disclosure — a sharp politician buying
+        # PUTS against a weak chart is agreeing with the chart, not betting against it.
+        t["contrarian"] = (quality == "sharp" and score is not None and score <= -1
+                            and bool(bullish_trades))
+
+        # Options trades are a stronger conviction signal than plain stock buys — but
+        # only when they're bullish (calls, not puts) and still have enough runway
+        # before expiration to be actionable (see MIN_OPTION_RUNWAY_DAYS).
+        t["hasOptionsActivity"] = bool(actionable_call_trades)
+        t["optionsBuyCount"]    = len(option_trades)
+        t["hasPutActivity"]     = any(tr.get("optionType") == "put" for tr in option_trades)
+
         t.pop("tradeReturns", None)
 
     order = {"available": 0, "pullback": 1, "fading": 2, "gone": 3, "unknown": 4}

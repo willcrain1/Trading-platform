@@ -106,6 +106,12 @@ export default function CongressModal({ symbol, onClose }: Props) {
                        : ticker.investorQuality === 'weak'  ? '#f85149' : '#8b949e',
                 },
                 ticker.opportunity ? { label: 'Opportunity', value: ticker.opportunity } : null,
+                ticker.hasOptionsActivity
+                  ? { label: 'Via options (bullish)', value: `${ticker.optionsBuyCount ?? 0} buy(s)`, color: '#3fb950' }
+                  : null,
+                ticker.hasPutActivity
+                  ? { label: 'Put activity', value: 'bearish', color: '#f85149' }
+                  : null,
               ].filter(Boolean).map((item, i) => (
                 <div key={i} style={{ background: '#0d1117', border: '1px solid #21262d',
                                       borderRadius: 6, padding: '8px 12px', textAlign: 'center', minWidth: 90 }}>
@@ -137,6 +143,7 @@ export default function CongressModal({ symbol, onClose }: Props) {
                   <thead>
                     <tr>
                       <th style={{ textAlign: 'left' }}>Politician</th>
+                      <th style={{ textAlign: 'left' }}>Instrument</th>
                       <th style={{ textAlign: 'left' }}>Tx date</th>
                       <th style={{ textAlign: 'left' }}>Disclosed</th>
                       <th style={{ textAlign: 'left' }}>Amount</th>
@@ -150,9 +157,26 @@ export default function CongressModal({ symbol, onClose }: Props) {
                       const total  = tr.totalReturnPct
                       const pctColor = (v: number | null | undefined) =>
                         v == null ? '#8b949e' : v > 0 ? '#3fb950' : '#f85149'
+                      const isOption = tr.assetType === 'option'
                       return (
                         <tr key={i}>
                           <td>{tr.politician}</td>
+                          <td>
+                            {isOption ? (
+                              <span
+                                style={{ color: tr.optionType === 'put' ? '#f85149' : '#3fb950', fontWeight: 600 }}
+                                title={[
+                                  tr.optionType === 'put' ? 'bearish bet' : tr.optionType === 'call' ? 'bullish bet' : null,
+                                  tr.strikePrice != null ? `strike $${tr.strikePrice}` : null,
+                                  tr.expirationDate ? `exp ${tr.expirationDate}` : null,
+                                ].filter(Boolean).join(', ') || undefined}
+                              >
+                                {(tr.optionType ?? 'option').toUpperCase()}
+                              </span>
+                            ) : (
+                              <span className="muted">Stock</span>
+                            )}
+                          </td>
                           <td>{tr.txDate}</td>
                           <td>{tr.disclosedDate}</td>
                           <td>{tr.amount}</td>

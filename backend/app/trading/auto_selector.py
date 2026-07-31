@@ -63,6 +63,9 @@ SMART_BUY_RSI_ENTRY      = 45    # rsi_revert buyBelow for Smart Buy instances (
                                   # the contrarian thesis is congressional conviction, not a second
                                   # oversold trigger stacked on top, so entry is loosened to convert
                                   # more of the bucket's instances into actual filled positions
+SMART_BUY_OPTIONS_BONUS  = 1.0   # composite-score bonus when the qualifying politician bought via
+                                  # options rather than shares — a leveraged, time-bound bet is a
+                                  # stronger conviction signal than a plain stock purchase
 
 # ── module-level result cache (for the status endpoint) ───────────────────────
 _last_result: dict = {}
@@ -172,6 +175,8 @@ def _candidate_score(c: dict) -> float:
         score += max(iq - 50, 0) / 25       # win-rate edge above 50%: 65%→+0.6, 100%→+2.0
         score += min(ann / 50, 3.0)         # annualized return: 50%→+1, 150%+→capped at +3
         score += min(buy_count * 0.2, 1.0)  # conviction: more buys backing it → up to +1
+        if c.get("hasOptionsActivity"):
+            score += SMART_BUY_OPTIONS_BONUS
     return score
 
 
@@ -217,6 +222,15 @@ def _selection_thesis(c: dict) -> str:
                 "Smart Buy (contrarian): sharp politician buying against a bearish/neutral"
                 " technical setup."
             )
+        if c.get("hasOptionsActivity"):
+            from ..routers.congress import MIN_OPTION_RUNWAY_DAYS  # local import — avoids circular import at module load
+            parts.append(
+                "At least one of these purchases was a bullish call option (not a put, and"
+                f" with {MIN_OPTION_RUNWAY_DAYS}+ days of runway left between disclosure and"
+                " expiration) rather than shares — a leveraged, time-bound bet, and a stronger"
+                f" conviction signal than a plain stock buy (+{SMART_BUY_OPTIONS_BONUS} to the"
+                " ranking score)."
+            )
     elif "congress" in sources:
         parts.append(
             "Also backed by Politician Trades: best individual politician annualized return"
@@ -244,6 +258,7 @@ def _selection_snapshot(c: dict) -> dict:
         "avgAnnualizedGain":    c.get("avgAnnualizedGain"),
         "maxAnnualizedGain":    c.get("maxAnnualizedGain"),
         "buyCount":             c.get("buyCount"),
+        "hasOptionsActivity":   c.get("hasOptionsActivity", False),
         "compositeScore":       round(_candidate_score(c), 2),
     }
 
@@ -353,7 +368,7 @@ def _gather_candidates() -> list[dict]:
     seen_sba: set[str] = set()
     for r in _db_rows(
         "SELECT ticker, score_at_detection, investor_quality_score, avg_annualized_gain, "
-        "max_ann_gain, buy_count "
+        "max_ann_gain, buy_count, has_options_activity "
         "FROM smart_buy_alerts WHERE detected_at >= ? "
         "ORDER BY detected_at DESC",
         (time.time() - SMART_BUY_MAX_DAYS * 86400,),
@@ -362,12 +377,14 @@ def _gather_candidates() -> list[dict]:
         if sym in seen_sba:
             continue
         seen_sba.add(sym)
+        has_options = bool(r["has_options_activity"])
         if sym in candidates:
             candidates[sym]["smartBuy"] = True
             candidates[sym]["investorQualityScore"] = r["investor_quality_score"]
             candidates[sym]["avgAnnualizedGain"]    = r["avg_annualized_gain"]
             candidates[sym]["maxAnnualizedGain"]    = r["max_ann_gain"]
             candidates[sym]["buyCount"]             = r["buy_count"]
+            candidates[sym]["hasOptionsActivity"]   = has_options
             candidates[sym]["sources"].append("smart_buy")
         else:
             candidates[sym] = {
@@ -383,6 +400,7 @@ def _gather_candidates() -> list[dict]:
                 "avgAnnualizedGain":    r["avg_annualized_gain"],
                 "maxAnnualizedGain":    r["max_ann_gain"],
                 "buyCount":             r["buy_count"],
+                "hasOptionsActivity":   has_options,
                 "sources":              ["smart_buy"],
             }
 

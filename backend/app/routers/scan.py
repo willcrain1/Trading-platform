@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS smart_buy_alerts (
   max_ann_gain           REAL,
   politicians            TEXT NOT NULL,
   buy_count              INTEGER NOT NULL DEFAULT 0,
-  opportunity            TEXT
+  opportunity            TEXT,
+  has_options_activity   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sba_ticker ON smart_buy_alerts(ticker, detected_at);
 """
@@ -99,8 +100,9 @@ def _get_conn() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.executescript(_SCHEMA)
         for col, typedef in [
-            ("avg_annualized_gain", "REAL"),
-            ("max_ann_gain",        "REAL"),
+            ("avg_annualized_gain",  "REAL"),
+            ("max_ann_gain",         "REAL"),
+            ("has_options_activity", "INTEGER NOT NULL DEFAULT 0"),
         ]:
             try:
                 _conn.execute(f"ALTER TABLE smart_buy_alerts ADD COLUMN {col} {typedef}")
@@ -238,8 +240,8 @@ def record_smart_buys(alerts: list[dict]) -> int:
                 "INSERT INTO smart_buy_alerts "
                 "(ticker, detected_at, score_at_detection, investor_quality, "
                 " investor_quality_score, avg_annualized_gain, max_ann_gain, "
-                " politicians, buy_count, opportunity) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " politicians, buy_count, opportunity, has_options_activity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         a["ticker"], now,
@@ -251,6 +253,7 @@ def record_smart_buys(alerts: list[dict]) -> int:
                         json.dumps(a.get("politicians", [])),
                         a.get("buyCount", 0),
                         a.get("opportunity"),
+                        1 if a.get("hasOptionsActivity") else 0,
                     )
                     for a in to_insert
                 ],

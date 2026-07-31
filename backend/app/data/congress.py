@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS congress_trades (
   amount             TEXT,
   asset_description  TEXT,
   district           TEXT,
+  asset_type         TEXT DEFAULT 'stock',
+  option_type        TEXT,
+  strike_price       REAL,
+  expiration_date    TEXT,
   UNIQUE(tx_type, source, ticker, politician, tx_date, disclosed_date, amount)
 );
 CREATE INDEX IF NOT EXISTS idx_congress_ticker     ON congress_trades(ticker);
@@ -81,6 +85,17 @@ def _get_conn() -> sqlite3.Connection:
         _conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.executescript(_SCHEMA)
+        # Migrate pre-existing DBs that predate the asset-type columns.
+        for col, typedef in [
+            ("asset_type",      "TEXT DEFAULT 'stock'"),
+            ("option_type",     "TEXT"),
+            ("strike_price",    "REAL"),
+            ("expiration_date", "TEXT"),
+        ]:
+            try:
+                _conn.execute(f"ALTER TABLE congress_trades ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # already exists
         _conn.commit()
     return _conn
 
@@ -103,17 +118,59 @@ def _meta_set(key: str, value: str) -> None:
         _get_conn().commit()
 
 
+# A politician trading options is a much stronger conviction signal than a plain
+# stock buy — expiring, leveraged, all-or-nothing — so it's worth telling apart.
+# Capitol Trades has no dedicated asset-type field; option details only show up as
+# free text in the filing's "comment" field. Requiring a non-null ticker excludes
+# the two known false-positive patterns: PE fund "capital call"s and bond "call"
+# (redemption) features, both of which describe non-equity holdings with no ticker.
+_OPTION_TYPE_RE = re.compile(r"option\s*type:?\s*(call|put)|(call|put)\s+options?\b", re.I)
+_STRIKE_RE      = re.compile(r"strike\s*price\s*(?:of|is|:)?\s*\$?([\d,]+\.?\d*)", re.I)
+_EXPIRATION_RE  = re.compile(r"expir\w*(?:\s*date)?\s*(?:of|is|:)?\s*\$?([\d/\-]{6,10})", re.I)
+
+
+def _classify_asset(comment: str, ticker: str | None) -> dict:
+    """Classify a disclosure as a plain stock trade or an options trade, extracting
+    call/put, strike, and expiration from the filing's free-text comment when present."""
+    default = {"assetType": "stock", "optionType": None, "strikePrice": None, "expirationDate": None}
+    if not ticker or not comment:
+        return default
+
+    m = _OPTION_TYPE_RE.search(comment)
+    if not m:
+        return default
+
+    option_type = (m.group(1) or m.group(2)).lower()
+    strike_m = _STRIKE_RE.search(comment)
+    strike = float(strike_m.group(1).replace(",", "")) if strike_m else None
+    exp_m = _EXPIRATION_RE.search(comment)
+    expiration = exp_m.group(1) if exp_m else None
+
+    return {"assetType": "option", "optionType": option_type,
+            "strikePrice": strike, "expirationDate": expiration}
+
+
 def _upsert_trades_nolock(conn: sqlite3.Connection, rows: list[dict], tx_type: str, source: str) -> int:
     added = 0
     for r in rows:
         try:
+            # ON CONFLICT DO UPDATE (not INSERT OR IGNORE) so re-scraping backfills the
+            # asset-type columns on rows inserted before this classifier existed — the
+            # values are purely derived from the same source comment, so refreshing them
+            # on conflict is always safe, never clobbers anything user-editable.
             conn.execute(
-                "INSERT OR IGNORE INTO congress_trades "
+                "INSERT INTO congress_trades "
                 "(tx_type, source, ticker, politician, chamber, party, tx_date, "
-                " disclosed_date, amount, asset_description, district) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " disclosed_date, amount, asset_description, district, "
+                " asset_type, option_type, strike_price, expiration_date) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(tx_type, source, ticker, politician, tx_date, disclosed_date, amount) "
+                "DO UPDATE SET asset_type=excluded.asset_type, option_type=excluded.option_type, "
+                "strike_price=excluded.strike_price, expiration_date=excluded.expiration_date",
                 (tx_type, source, r["ticker"], r["politician"], r["chamber"], r["party"],
-                 r["txDate"], r["disclosedDate"], r["amount"], r["assetDescription"], r["district"]),
+                 r["txDate"], r["disclosedDate"], r["amount"], r["assetDescription"], r["district"],
+                 r.get("assetType", "stock"), r.get("optionType"),
+                 r.get("strikePrice"), r.get("expirationDate")),
             )
             added += conn.execute("SELECT changes()").fetchone()[0]
         except Exception:
@@ -147,6 +204,10 @@ def _row_to_trade(r: dict) -> dict:
         "amount":           r["amount"] or "",
         "assetDescription": r["asset_description"] or "",
         "district":         r["district"] or "",
+        "assetType":        r["asset_type"] if "asset_type" in r.keys() else "stock",
+        "optionType":       r["option_type"] if "option_type" in r.keys() else None,
+        "strikePrice":      r["strike_price"] if "strike_price" in r.keys() else None,
+        "expirationDate":   r["expiration_date"] if "expiration_date" in r.keys() else None,
     }
 
 
@@ -238,6 +299,7 @@ def _raw_to_normalized(raw: dict) -> dict | None:
 
     value = raw.get("value") or 0
     amount = _value_to_range(value)
+    asset = _classify_asset(raw.get("comment") or "", ticker_raw)
 
     return {
         "ticker":           ticker_raw,
@@ -249,6 +311,7 @@ def _raw_to_normalized(raw: dict) -> dict | None:
         "amount":           amount,
         "assetDescription": issuer.get("issuerName") or "",
         "district":         pol.get("_stateId") or "",
+        **asset,
     }
 
 
@@ -547,7 +610,8 @@ def get_recent_buys(days_back: int = 90, chamber: str = "both") -> list[dict]:
     source = _meta_get("active_source") or "scrape"
     sql = (
         "SELECT ticker, politician, chamber, party, tx_date, disclosed_date, amount, "
-        "asset_description, district FROM congress_trades "
+        "asset_description, district, asset_type, option_type, strike_price, expiration_date "
+        "FROM congress_trades "
         "WHERE tx_type='buy' AND source=? AND "
         "(CASE WHEN tx_date != '' THEN tx_date ELSE disclosed_date END) >= ?"
     )
