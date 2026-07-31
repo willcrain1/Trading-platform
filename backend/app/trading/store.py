@@ -219,6 +219,27 @@ def set_cash(cash: float) -> None:
         conn.commit()
 
 
+def adjust_cash(delta: float, *, min_cash: float | None = None) -> float:
+    """Atomically read-modify-write cash by delta under a single lock acquisition.
+
+    Broker code previously did `cash = get_cash()` then `set_cash(cash ± amount)` as two
+    separate lock acquisitions — if two orders filled close enough together, the second
+    write could silently overwrite the first using a stale read (a lost-update race),
+    permanently dropping part of a real cash movement with no error or trace. Reading and
+    writing inside one `with _lock` closes that window. Raises ValueError (leaving cash
+    unchanged) if min_cash is given and the result would fall below it.
+    """
+    with _lock:
+        conn = get_conn()
+        cur_cash = conn.execute("SELECT cash FROM account WHERE id = 1").fetchone()[0]
+        new_cash = cur_cash + delta
+        if min_cash is not None and new_cash < min_cash - 1e-6:
+            raise ValueError(f"insufficient cash: have {cur_cash:,.2f}, need {-delta:,.2f}")
+        conn.execute("UPDATE account SET cash = ? WHERE id = 1", (new_cash,))
+        conn.commit()
+        return new_cash
+
+
 def get_positions() -> list[dict]:
     """Net positions derived from fills. Positive qty = long, negative = short."""
     with _lock:
@@ -409,14 +430,20 @@ def open_plans() -> list[dict]:
     return rows
 
 
-def close_plan(plan_id: int, exit_order_id: int, exit_price: float, reason: str) -> None:
+def close_plan(plan_id: int, exit_order_id: int, exit_price: float, reason: str) -> bool:
+    """Close a plan. The WHERE clause requires status='open' so a plan already closed
+    by a concurrent call (e.g. check_exits_intraday overlapping a scheduled engine run
+    that internally calls check_exits — both fire at :00 past the hour) becomes a safe
+    no-op instead of overwriting the real close with stale/duplicate data. Returns
+    whether this call actually closed it."""
     with _lock:
         conn = get_conn()
         row = conn.execute(
-            "SELECT qty, entry_price, direction FROM trade_plans WHERE id = ?", (plan_id,)
+            "SELECT qty, entry_price, direction FROM trade_plans WHERE id = ? AND status = 'open'",
+            (plan_id,),
         ).fetchone()
         if row is None:
-            return
+            return False
         direction = row["direction"] if "direction" in row.keys() else "long"
         if direction == "short":
             # Short profit: entered high, exiting low
@@ -428,11 +455,33 @@ def close_plan(plan_id: int, exit_order_id: int, exit_price: float, reason: str)
         conn.execute(
             "UPDATE trade_plans SET status = 'closed', exit_order_id = ?, exit_price = ?,"
             " exit_reason = ?, closed_at = ?, realized_pnl = ?, realized_pnl_pct = ?"
-            " WHERE id = ?",
+            " WHERE id = ? AND status = 'open'",
             (exit_order_id, exit_price, reason, time.time(),
              round(pnl, 2), round(pnl_pct, 3), plan_id),
         )
         conn.commit()
+        return True
+
+
+def close_plan_untracked(plan_id: int, reason: str = "manual") -> bool:
+    """Close a plan whose position is already gone with no matching order. Only two
+    legitimate causes: (1) a genuine orphan — the position vanished some other way
+    while the plan stayed open, or (2) a concurrent call already closed it correctly
+    moments ago (see close_plan()'s docstring) and this is a stale second pass. The
+    status='open' guard means case (2) is a no-op — it never overwrites a real close
+    with fabricated data. For real case (1), no exit price/order/P&L is invented
+    (close_plan() would otherwise price a nonexistent trade at the current quote and
+    silently record realized P&L that never actually happened)."""
+    with _lock:
+        conn = get_conn()
+        cur = conn.execute(
+            "UPDATE trade_plans SET status = 'closed', exit_order_id = NULL, exit_price = NULL,"
+            " exit_reason = ?, closed_at = ?, realized_pnl = NULL, realized_pnl_pct = NULL"
+            " WHERE id = ? AND status = 'open'",
+            (reason, time.time(), plan_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def list_plans(status: str = "all", limit: int = 100) -> list[dict]:

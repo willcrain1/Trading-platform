@@ -50,25 +50,29 @@ class PaperBroker:
         price = client.get_quote(symbol)["last"]
         if price is None or price <= 0:
             raise OrderRejected(f"no quote available for {symbol}")
-        cash = self.get_cash()
         positions = store.get_positions()
 
+        # Cash reads and writes go through store.adjust_cash(), a single atomic
+        # read-modify-write — see its docstring for why the old get_cash()-then-
+        # set_cash() two-step was a lost-update race between concurrent orders.
         if side == "buy":
             cost = qty * price
-            if cost > cash + 1e-6:
+            try:
+                store.adjust_cash(-cost, min_cash=0.0)
+            except ValueError:
+                cash = self.get_cash()
                 raise OrderRejected(f"insufficient cash: need ${cost:,.2f}, have ${cash:,.2f}")
-            store.set_cash(cash - cost)
 
         elif side == "sell":
             held = next((p["qty"] for p in positions
                          if p["symbol"] == symbol.upper() and p["qty"] > 0), 0.0)
             if qty > held + 1e-6:
                 raise OrderRejected(f"cannot sell {qty} {symbol}: only {held:.4f} held")
-            store.set_cash(cash + qty * price)
+            store.adjust_cash(qty * price)
 
         elif side == "short":
             # Receive short-sale proceeds; no cash headroom check in paper trading
-            store.set_cash(cash + qty * price)
+            store.adjust_cash(qty * price)
 
         elif side == "cover":
             held_short = abs(next((p["qty"] for p in positions
@@ -77,7 +81,7 @@ class PaperBroker:
                 raise OrderRejected(
                     f"cannot cover {qty} {symbol}: only {held_short:.4f} shares short"
                 )
-            store.set_cash(cash - qty * price)
+            store.adjust_cash(-qty * price)
 
         else:
             raise OrderRejected(f"unknown side '{side}'")

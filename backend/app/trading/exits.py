@@ -100,7 +100,9 @@ def check_exits(record_run: bool = True) -> dict:
         held = held_short if direction == "short" else held_long
         qty = min(plan["qty"], held)
         if qty <= 0:
-            store.close_plan(plan["id"], plan["entry_order_id"], float(last), reason)
+            # No real position to sell — closing at the current quote would fabricate a
+            # realized P&L for a trade that never happened. See close_plan_untracked().
+            store.close_plan_untracked(plan["id"], reason="manual")
             errors.append(f"{symbol}: plan {plan['id']} open with no position — closed without order")
             continue
 
