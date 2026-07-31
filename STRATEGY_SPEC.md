@@ -49,35 +49,36 @@ flowchart TD
 
 The two signal sources (Technical/Sustained and Smart Buy) feed the same downstream pipeline but represent opposite theses — one follows the chart, the other deliberately bets against it when a historically sharp politician disagrees with it — which is why they're tracked as separate portfolio buckets throughout sizing, execution, and reporting rather than merged into one undifferentiated trade list. Every other part of the pipeline (analyst review, broker fill, exit management) is shared and source-agnostic. The sections below specify each box in this diagram exactly.
 
-### Performance so far (as of 2026-07-29, ~17 days live)
+### Performance so far (as of 2026-07-31, ~19 days live)
 
-**Real account equity** — the number that actually matters — has grown modestly:
+**Real account equity** — the number that actually matters:
 
 | | Value |
 |---|---|
 | Starting equity | $20,000.00 |
-| Current equity | $20,103.02 |
-| Total account gain | +$103.02 (**+0.515%**) over ~17 days |
-| S&P 500, same window | -2.63% |
+| Current equity | $20,783.31 |
+| Total account gain | +$783.31 (**+3.92%**) over ~19 days |
+| S&P 500, same window | -1.00% |
+| Outperformance | +4.91 percentage points |
 
-The account is beating the index, but by a much smaller margin than the trade-level stats below might suggest — see the caveat at the end of this section.
+**A data-integrity note, since it materially changed this section:** an audit on 2026-07-30 found two real accounting bugs — (1) `PaperBroker`'s cash update was a non-atomic read-then-write, so two orders filling close together (plausible daily, since `check_exits_intraday` and `paper_open`/`auto_select_open` are scheduled for the same minute) could silently lose part of a cash movement; (2) a "position already gone" fallback in `exits.py` could fabricate or clobber a trade's realized P&L when a plan got evaluated twice by overlapping runs. Together these had suppressed real equity by ~$701.60 (the account was actually performing *better* than it displayed, not worse). Both are now fixed with atomic cash updates and a `status='open'` guard on plan closes (see `store.adjust_cash()`, `close_plan()`, `close_plan_untracked()`); the one affected historical trade and the full equity-snapshot history were corrected to match. The **+3.92%** figure above is the corrected number — pre-fix, this section reported +0.51%.
 
-**Closed-trade stats, by source bucket** (30 closed trades total so far):
+**Closed-trade stats, by source bucket** (33 closed trades total so far):
 
 | | All | Smart Buy | Technical/Sustained |
 |---|---|---|---|
-| Closed trades | 30 | 19 | 11 |
-| Win rate | 73.3% | 84.2% | 54.5% |
-| Realized P&L | +$959.45 | +$548.35 | +$411.10 |
-| Avg win / avg loss | +5.03% / -6.8% | +4.22% / -10.99% | +7.18% / -4.28% |
-| Profit factor | 3.28 | 4.69 | 2.50 |
-| Sharpe (trade-based, see §12) | 7.66 | 5.73 | 4.92 |
-| Max drawdown | -18.06% | -18.06% | -6.42% |
-| Unrealized P&L (open book) | -$154.84 | -$210.19 | +$55.35 |
+| Closed trades | 33 | 21 | 12 |
+| Win rate | 66.7% | 76.2% | 50.0% |
+| Realized P&L | +$835.15 | +$492.30 | +$342.85 |
+| Avg win / avg loss | +5.03% / -5.85% | +4.22% / -7.67% | +7.18% / -4.33% |
+| Profit factor | 2.53 | 3.41 | 2.00 |
+| Sharpe (trade-based, see §12) | 5.96 | 4.61 | 3.63 |
+| Max drawdown | -22.56% | -18.06% | -6.42% |
+| Unrealized P&L (open book) | -$51.87 | -$70.48 | +$18.61 |
 
-Both buckets are net profitable and both are beating the index by a wide margin at the trade level, but they win in different ways: **Smart Buy** (the `rsi_revert` mean-reversion strategy) wins often and small, with an occasional sharp loss — it took its first stop-outs after an initial 11-trade, zero-drawdown streak, which pulled its Sharpe down from an early 30.80 to a more sustainable 5.73. **Technical/Sustained** (`ema_cross_9_21`) wins less often but bigger, with a calmer drawdown profile. Exit-reason breakdown across all 30 trades: 15 signal exits (net +$272.95), 10 target hits (+$983.83), 5 stop-losses (-$297.33).
+Both buckets remain net profitable and both are beating the index at the trade level, still winning in different ways: **Smart Buy** (the `rsi_revert` mean-reversion strategy) wins often and small, with occasional sharp losses (avg loss -7.67% vs. avg win +4.22%). **Technical/Sustained** (`ema_cross_9_21`) wins less often but bigger (avg win +7.18% vs. avg loss -4.33%), with a much calmer drawdown profile. Exit-reason breakdown across all 33 trades: 15 signal exits (net +$272.95), 10 target hits (+$983.83), 8 stop-losses (-$421.63).
 
-**Important caveat — read the trade-level numbers as "the trades that finished," not "portfolio growth":** the 64.7%/35.4%/21.64% "total return" figures above compound each closed trade's *percentage* return in sequence, as if 100% of capital rotated through every trade. In reality only 0.5–1% of equity is risked per trade (§7), so those figures measure trade-picking skill, not account growth — which is why the real, whole-account equity is only up 0.515% while the compounded-trade numbers look dramatically higher. This gap will narrow as a larger share of capital gets deployed and more trades close. The sample is also still small (30 trades, ~17 days) — Sharpe and drawdown numbers this early are noisy and should not be treated as a stable long-run track record. See §12 and §13 for exactly how each figure is computed.
+**Important caveat — read the trade-level numbers as "the trades that finished," not "portfolio growth":** the 48.82%/28.19%/16.1% "total return" figures (not shown above, see the live `/api/paper/stats` response) compound each closed trade's *percentage* return in sequence, as if 100% of capital rotated through every trade. In reality only 0.5–1% of equity is risked per trade (§7), so those figures measure trade-picking skill, not account growth — which is why real, whole-account equity is up 3.92% while the compounded-trade numbers run much higher. This gap will narrow as a larger share of capital gets deployed and more trades close. The sample is also still small (33 trades, ~19 days) — Sharpe and drawdown numbers this early are noisy and should not be treated as a stable long-run track record. See §12 and §13 for exactly how each figure is computed.
 
 ---
 
