@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import {
   createChart,
+  createSeriesMarkers,
   CandlestickSeries,
   LineSeries,
   HistogramSeries,
@@ -18,11 +19,19 @@ export interface Overlay {
   dashed?: boolean
 }
 
+export interface ChartMarker {
+  time: number
+  price: number
+  text: string
+  color: string
+}
+
 interface Props {
   candles: Candle[]
   overlays?: Overlay[]
   levels?: Level[]
   priceLines?: { price: number; color: string; title: string }[]
+  markers?: ChartMarker[]
   height?: number
   showVolume?: boolean
 }
@@ -38,7 +47,7 @@ const CHART_OPTS = {
   crosshair: { mode: 0 },
 }
 
-export default function CandleChart({ candles, overlays = [], levels = [], priceLines = [], height = 420, showVolume = false }: Props) {
+export default function CandleChart({ candles, overlays = [], levels = [], priceLines = [], markers = [], height = 420, showVolume = false }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
 
@@ -94,6 +103,20 @@ export default function CandleChart({ candles, overlays = [], levels = [], price
       })
     }
 
+    if (markers.length > 0) {
+      createSeriesMarkers(
+        candleSeries,
+        markers.map((m) => ({
+          time: m.time as UTCTimestamp,
+          position: 'atPriceMiddle' as const,
+          price: m.price,
+          shape: 'circle' as const,
+          color: m.color,
+          text: m.text,
+        })),
+      )
+    }
+
     if (showVolume && candles.some((c) => c.volume > 0)) {
       const volSeries = chart.addSeries(HistogramSeries, {
         priceScaleId: 'vol',
@@ -123,7 +146,7 @@ export default function CandleChart({ candles, overlays = [], levels = [], price
       chart.remove()
       chartRef.current = null
     }
-  }, [candles, overlays, levels, priceLines, height, showVolume])
+  }, [candles, overlays, levels, priceLines, markers, height, showVolume])
 
   return <div ref={containerRef} />
 }

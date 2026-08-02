@@ -54,6 +54,33 @@ export interface Signals {
   levels: Level[]
 }
 
+export interface ElliottPivot {
+  time: number
+  price: number
+  type: 'high' | 'low'
+  confirmedAt: number
+}
+
+export interface ElliottWaveLabel {
+  label: '1' | '2' | '3' | '4' | '5' | 'A' | 'B' | 'C'
+  time: number
+  price: number
+  confirmed: boolean
+}
+
+export interface ElliottWaveResult {
+  symbol: string
+  stale: boolean
+  pivots: ElliottPivot[]
+  waveType: 'impulse' | 'correction' | null
+  direction: 'bullish' | 'bearish' | null
+  waves: ElliottWaveLabel[]
+  confidence: number
+  projectedTarget: number | null
+  projectionBasis: string | null
+  notes: string[]
+}
+
 export interface MacroAsset {
   symbol: string
   name: string
@@ -689,6 +716,10 @@ export const api = {
       `/api/ticker/${symbol}/vwap?days=${days}`,
     ),
   signals: (symbol: string) => get<Signals>(`/api/ticker/${symbol}/signals`),
+  elliottWave: (symbol: string, period: string, atrMult?: number) =>
+    get<ElliottWaveResult>(
+      `/api/ticker/${symbol}/elliott-wave?period=${period}${atrMult != null ? `&atrMult=${atrMult}` : ''}`,
+    ),
   macro: () => get<MacroSnapshot>('/api/macro/snapshot'),
   gex: (symbol: string, expiration?: string) =>
     get<GexData>(

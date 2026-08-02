@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { api, type Candle, type IndicatorBundle, type Signals } from '../api'
-import CandleChart, { type Overlay } from '../components/CandleChart'
+import { api, type Candle, type ElliottWaveResult, type IndicatorBundle, type Signals } from '../api'
+import CandleChart, { type ChartMarker, type Overlay } from '../components/CandleChart'
 import LineChart from '../components/LineChart'
 import StatTile from '../components/StatTile'
 import Tip from '../components/Tip'
 
 const PERIODS = ['3mo', '6mo', '1y', '2y', '5y']
 
-type OverlayKey = 'sma' | 'ema' | 'bollinger' | 'levels' | 'volume' | 'obv'
+type OverlayKey = 'sma' | 'ema' | 'bollinger' | 'levels' | 'volume' | 'obv' | 'elliottWave'
 
 const OVERLAY_TIPS: Record<OverlayKey, string> = {
   sma: 'Simple Moving Averages (20/50/200-day) — the average close over the last N days. Price holding above a rising SMA suggests an uptrend; a shorter SMA crossing above/below a longer one (e.g. 50 vs 200) is the classic golden/death cross signal.',
@@ -17,6 +17,12 @@ const OVERLAY_TIPS: Record<OverlayKey, string> = {
   levels: 'Support/Resistance — price levels where the chart has repeatedly reversed (clustered swing highs/lows). More "touches" means a level has been tested more often and is read as stronger.',
   volume: 'Volume bars overlaid at the bottom of the price chart — green when the bar closed up, red when it closed down. Useful for confirming breakouts (high volume) or flagging weak moves (low volume).',
   obv: 'On-Balance Volume — a running total that adds volume on up-days and subtracts it on down-days. Divergence between OBV and price is a classic leading signal: OBV rising while price stalls suggests accumulation.',
+  elliottWave: 'Elliott Wave — an automated, best-effort wave count (zigzag swing detection + Elliott\'s structural rules + Fibonacci-ratio scoring). This is one plausible count, not a definitive read — Elliott Wave is inherently subjective even among professional analysts. The gray dashed line is the raw swing structure; the colored line highlights the labeled count.',
+}
+
+const OVERLAY_LABELS: Record<OverlayKey, string> = {
+  sma: 'SMA', ema: 'EMA', bollinger: 'BOLLINGER', levels: 'LEVELS', volume: 'VOLUME', obv: 'OBV',
+  elliottWave: 'ELLIOTT WAVE',
 }
 
 export default function TickerAnalysis() {
@@ -32,12 +38,17 @@ export default function TickerAnalysis() {
     levels: true,
     volume: false,
     obv: false,
+    elliottWave: false,
   })
   const [candles, setCandles] = useState<Candle[]>([])
   const [ind, setInd] = useState<IndicatorBundle | null>(null)
   const [signals, setSignals] = useState<Signals | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+
+  const [ew, setEw] = useState<ElliottWaveResult | null>(null)
+  const [ewLoading, setEwLoading] = useState(false)
+  const [ewError, setEwError] = useState<string | null>(null)
 
   const load = useCallback(async (sym: string, per: string) => {
     setLoading(true)
@@ -62,6 +73,18 @@ export default function TickerAnalysis() {
     load(symbol, period)
   }, [symbol, period, load])
 
+  useEffect(() => {
+    if (!show.elliottWave) return
+    let cancelled = false
+    setEwLoading(true)
+    setEwError(null)
+    api.elliottWave(symbol, period)
+      .then((r) => { if (!cancelled) setEw(r) })
+      .catch((e) => { if (!cancelled) setEwError((e as Error).message) })
+      .finally(() => { if (!cancelled) setEwLoading(false) })
+    return () => { cancelled = true }
+  }, [show.elliottWave, symbol, period])
+
   const overlays = useMemo<Overlay[]>(() => {
     if (!ind) return []
     const out: Overlay[] = []
@@ -78,10 +101,35 @@ export default function TickerAnalysis() {
       out.push({ points: ind.bbUpper, color: '#8b949e', dashed: true, title: 'BB+2σ' })
       out.push({ points: ind.bbLower, color: '#8b949e', dashed: true, title: 'BB-2σ' })
     }
+    if (show.elliottWave && ew) {
+      const waveColor = ew.direction === 'bearish' ? '#f85149' : '#3fb950'
+      out.push({
+        points: ew.pivots.map((p) => ({ time: p.time, value: p.price })),
+        color: '#8b949e', dashed: true, lineWidth: 1, title: 'Zigzag',
+      })
+      if (ew.waves.length > 0) {
+        out.push({
+          points: ew.waves.map((w) => ({ time: w.time, value: w.price })),
+          color: waveColor, lineWidth: 2, title: 'Wave count',
+        })
+      }
+    }
     return out
-  }, [ind, show])
+  }, [ind, show, ew])
 
   const levels = useMemo(() => (show.levels && ind ? ind.levels : []), [ind, show.levels])
+
+  const ewMarkers = useMemo<ChartMarker[]>(() => {
+    if (!show.elliottWave || !ew) return []
+    const color = ew.direction === 'bearish' ? '#f85149' : '#3fb950'
+    return ew.waves.map((w) => ({ time: w.time, price: w.price, text: w.label, color }))
+  }, [show.elliottWave, ew])
+
+  const ewTargetLine = useMemo(() => {
+    if (!show.elliottWave || !ew || ew.projectedTarget == null) return []
+    const color = ew.direction === 'bearish' ? '#f85149' : '#3fb950'
+    return [{ price: ew.projectedTarget, color, title: 'W5 target' }]
+  }, [show.elliottWave, ew])
 
   const rsiLines = useMemo(
     () => (ind ? [{ points: ind.rsi, color: '#58a6ff', title: 'RSI(14)' }] : []),
@@ -140,9 +188,9 @@ export default function TickerAnalysis() {
             <option key={p} value={p}>{p}</option>
           ))}
         </select>
-        {(['sma', 'ema', 'bollinger', 'levels', 'volume', 'obv'] as OverlayKey[]).map((k) => (
+        {(['sma', 'ema', 'bollinger', 'levels', 'volume', 'obv', 'elliottWave'] as OverlayKey[]).map((k) => (
           <label key={k} style={{ fontSize: 13, color: show[k] ? '#e6edf3' : '#8b949e' }}>
-            <input type="checkbox" checked={show[k]} onChange={() => toggle(k)} /> {k.toUpperCase()}
+            <input type="checkbox" checked={show[k]} onChange={() => toggle(k)} /> {OVERLAY_LABELS[k]}
             <Tip text={OVERLAY_TIPS[k]} />
           </label>
         ))}
@@ -151,6 +199,25 @@ export default function TickerAnalysis() {
       {error && <div className="error-banner">{error}</div>}
       {ind?.stale && (
         <div className="stale-banner">Data source unreachable — showing last cached data.</div>
+      )}
+      {show.elliottWave && ewError && <div className="error-banner">Elliott Wave: {ewError}</div>}
+
+      {show.elliottWave && ew && !ewLoading && (
+        <div className="tiles">
+          <StatTile label="Wave type" value={ew.waveType ?? 'no valid count'}
+            tone={ew.waveType ? 'neutral' : 'warn'}
+            tooltip="Whether the most recent swing structure fits a 5-wave impulse or a 3-wave (A-B-C) correction under Elliott's structural rules." />
+          <StatTile label="Direction" value={ew.direction ?? '—'}
+            tone={ew.direction === 'bullish' ? 'pos' : ew.direction === 'bearish' ? 'neg' : 'neutral'}
+            tooltip="The trend direction implied by the wave count." />
+          <StatTile label="Confidence" value={`${ew.confidence}%`}
+            tone={ew.confidence >= 60 ? 'pos' : ew.confidence >= 30 ? 'neutral' : 'warn'}
+            tooltip="How closely the count's wave ratios match common Fibonacci retracement/extension guidelines — not a probability of being 'correct'. Structural rules were already enforced to even reach a candidate; this only scores how textbook-clean it looks." />
+          {ew.projectedTarget != null && (
+            <StatTile label="Wave 5 target" value={ew.projectedTarget} tone="neutral"
+              tooltip={ew.projectionBasis ?? undefined} />
+          )}
+        </div>
       )}
 
       {signals && !error && (
@@ -184,7 +251,8 @@ export default function TickerAnalysis() {
             Price
             <Tip text="Candlesticks: green = close above open, red = close below open. Dashed green/red horizontal lines are the strongest support/resistance levels. Overlay colors match the checkboxes above (SMA20 blue, SMA50 amber, SMA200 purple; EMA9 teal, EMA21 pink; Bollinger bands gray dashed). VOLUME adds semi-transparent bars at the bottom of the price pane." />
           </h2>
-          <CandleChart candles={candles} overlays={overlays} levels={levels} showVolume={show.volume} />
+          <CandleChart candles={candles} overlays={overlays} levels={levels} priceLines={ewTargetLine}
+            markers={ewMarkers} showVolume={show.volume} />
         </div>
       )}
 

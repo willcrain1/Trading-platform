@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from ..data import client
+from . import elliott
 from . import indicators as ind
 
 TRADING_DAYS = 252
@@ -330,6 +331,65 @@ def _strat_dual_momentum_bond(df: pd.DataFrame, p: dict) -> pd.Series:
         return abs_mom.astype(float)
 
 
+# ── Elliott Wave ──────────────────────────────────────────────────────────────
+# See analysis/elliott.py's module docstring for the subjectivity caveat this
+# strategy inherits — it trades a heuristic, rule-validated wave count, not a
+# settled read of the chart.
+
+def _ew_entry_signal(p0: dict, p1: dict, p2: dict) -> int | None:
+    """+1/-1 if pivots p0-p1-p2 form a valid waves-1-2 setup (anticipating an
+    imminent wave 3), else None."""
+    sign = 1 if p1["price"] > p0["price"] else -1
+    w1 = sign * (p1["price"] - p0["price"])
+    w2 = sign * (p1["price"] - p2["price"])
+    if w1 <= 0 or w2 <= 0 or w2 >= w1:
+        return None
+    return sign
+
+
+def _strat_elliott_wave(df: pd.DataFrame, p: dict) -> pd.Series:
+    """Walks confirmed zigzag pivots chronologically (causal — a pivot is only
+    visible once its confirmedAt bar has passed). Enters when waves 1-2 just
+    validated (anticipating wave 3), holds through the impulse, and flattens
+    when wave 4 overlaps wave 1 (count invalidated) or wave 5 confirms
+    (impulse exhausted). Symmetric for bullish/bearish impulses."""
+    atr_mult = p.get("atrMult", elliott.DEFAULT_ATR_MULT)
+    candles = df[["time", "open", "high", "low", "close", "volume"]].to_dict("records")
+    pivots = elliott.zigzag(candles, atr_mult)
+    pos = pd.Series(0.0, index=df.index)
+    if len(pivots) < 3:
+        return pos
+
+    times = df["time"].values
+    confirmed: list[dict] = []
+    pi = 0
+    signal = 0.0
+    anchor: int | None = None       # index into `confirmed` of the active count's wave-1 origin
+    direction_sign = 0
+
+    for i, t in enumerate(times):
+        while pi < len(pivots) and pivots[pi]["confirmedAt"] <= t:
+            confirmed.append(pivots[pi])
+            pi += 1
+            n = len(confirmed)
+
+            if anchor is None:
+                if n >= 3:
+                    sig = _ew_entry_signal(confirmed[-3], confirmed[-2], confirmed[-1])
+                    if sig is not None:
+                        anchor, direction_sign, signal = n - 3, sig, float(sig)
+            else:
+                if anchor + 4 < n:
+                    p1w, p4w = confirmed[anchor + 1], confirmed[anchor + 4]
+                    if direction_sign * (p4w["price"] - p1w["price"]) <= 0:
+                        signal, anchor, direction_sign = 0.0, None, 0
+                if anchor is not None and anchor + 5 < n:
+                    signal, anchor, direction_sign = 0.0, None, 0  # wave 5 confirmed — impulse exhausted
+
+        pos.iloc[i] = signal
+    return pos
+
+
 # Strategies that internally cross-reference an equity-specific instrument (SPY for
 # relative momentum, ^VIX for regime filtering, TLT for bond rotation) — economically
 # meaningless for a crypto symbol, so excluded from auto-deploy's "try every strategy,
@@ -500,6 +560,14 @@ STRATEGIES = {
         "params": {"lookback": 252},
         "maxHoldDays": 90,
         "bondTicker": "TLT",
+    },
+    # ── Elliott Wave ─────────────────────────────────────────────────────────
+    "elliott_wave": {
+        "fn": _strat_elliott_wave,
+        "label": "Elliott Wave (wave 3 entry)",
+        "params": {"atrMult": elliott.DEFAULT_ATR_MULT},
+        "maxHoldDays": 90,
+        "supportsShort": True,
     },
 }
 

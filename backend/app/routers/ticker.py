@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from ..analysis import indicators
+from ..analysis import elliott, indicators
 from ..data import app_config, client
 
 router = APIRouter(prefix="/api/ticker", tags=["ticker"])
@@ -121,4 +121,19 @@ def ticker_signals(symbol: str, period: str = Query("2y")):
         "symbol": hist["symbol"],
         "stale": hist.get("stale", False),
         **indicators.compute_signals(hist["candles"]),
+    }
+
+
+@router.get("/{symbol}/elliott-wave")
+def ticker_elliott_wave(symbol: str, period: str = Query("2y"),
+                        atrMult: float = Query(elliott.DEFAULT_ATR_MULT, gt=0, le=10)):
+    """Best-effort Elliott Wave count — see analysis/elliott.py's module
+    docstring for the subjectivity caveat this always carries."""
+    if period not in VALID_PERIODS:
+        raise HTTPException(400, f"period must be one of {sorted(VALID_PERIODS)}")
+    hist = _history_or_404(symbol, period)
+    return {
+        "symbol": hist["symbol"],
+        "stale": hist.get("stale", False),
+        **elliott.compute_elliott_wave(hist["candles"], atrMult),
     }
