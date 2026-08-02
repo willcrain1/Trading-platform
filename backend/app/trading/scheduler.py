@@ -16,6 +16,13 @@ breach is caught close to when it happens rather than only at the 10:00/16:00
 engine runs. A breach outside that window (pre/post-market) just waits — the
 next in-window check (or the 10:00/16:00 run) is what fills it, same as a
 real day-session-only stop/limit order.
+
+Crypto trades 24/7, so it gets its own cadence instead of riding the equity
+jobs above — every 4 hours for new-signal evaluation/selection, every 30 min
+for exits, every day of the week, no market-hours gate. Each crypto job calls
+the same run_engine/run_auto_selection/check_exits functions the equity jobs
+use, scoped to portfolio_ids=[BUCKET_CRYPTO] so a crypto tick never
+redundantly re-touches equity instances.
 """
 from __future__ import annotations
 
@@ -26,11 +33,12 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from ..data import cot as cot_data
 from ..routers.congress import get_cached_smart_buys
 from ..routers.scan import record_smart_buys
-from . import exits
+from . import exits, store
 from .auto_selector import run_auto_selection
 from .engine import run_engine
 
@@ -100,6 +108,35 @@ def _check_exits_intraday() -> None:
         log.exception("intraday exit check failed")
 
 
+def _run_crypto() -> None:
+    try:
+        result = run_engine("crypto", portfolio_ids=[store.BUCKET_CRYPTO])
+        log.info("crypto engine run finished: %s", result["results"])
+    except Exception:
+        log.exception("crypto engine run failed")
+
+
+def _auto_select_crypto() -> None:
+    try:
+        result = run_auto_selection("crypto", portfolio_ids=[store.BUCKET_CRYPTO])
+        log.info("crypto auto-select: selected=%d candidates=%d errors=%d",
+                 result.get("selected", 0), result.get("candidates", 0), len(result.get("errors", [])))
+    except Exception:
+        log.exception("crypto auto-select failed")
+
+
+def _check_exits_crypto() -> None:
+    """Crypto's own 24/7 exit sweep — no market-hours gate, since the asset never
+    closes. Scoped to just the crypto portfolio."""
+    try:
+        result = exits.check_exits(portfolio_ids=[store.BUCKET_CRYPTO])
+        if result["exited"] or result["errors"]:
+            log.info("crypto exit check: %d exited, %d errors",
+                     len(result["exited"]), len(result["errors"]))
+    except Exception:
+        log.exception("crypto exit check failed")
+
+
 def _cot_refresh() -> None:
     try:
         result = cot_data.refresh(years_back=3)
@@ -138,6 +175,20 @@ def start() -> None:
     scheduler.add_job(
         _check_exits_intraday, CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/15"),
         id="check_exits_intraday", replace_existing=True,
+    )
+    # Crypto: every 4 hours, every day, no market-hours gate — auto-select runs 5
+    # min after the engine pass (same offset pattern as the equity jobs above).
+    scheduler.add_job(
+        _run_crypto, CronTrigger(day_of_week="*", hour="*/4", minute=0),
+        id="crypto_engine", replace_existing=True,
+    )
+    scheduler.add_job(
+        _auto_select_crypto, CronTrigger(day_of_week="*", hour="*/4", minute=5),
+        id="crypto_auto_select", replace_existing=True,
+    )
+    scheduler.add_job(
+        _check_exits_crypto, IntervalTrigger(minutes=30),
+        id="crypto_exits", replace_existing=True,
     )
     scheduler.start()
 

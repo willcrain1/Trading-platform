@@ -6,16 +6,32 @@ import Tip from '../components/Tip'
 
 type View = 'trades' | 'autoLog'
 type Filter = 'all' | 'open' | 'closed'
-type SourceFilter = 'all' | 'smartBuy' | 'technicalSustained'
+type SourceFilter = 'all' | 'smartBuy' | 'technicalSustained' | 'crypto'
 
 const SOURCE_FILTER_LABELS: Record<SourceFilter, string> = {
   all: 'All sources',
   smartBuy: 'Smart Buy',
   technicalSustained: 'Technical/Sustained',
+  crypto: 'Crypto',
+}
+
+const FILTER_FOR_PORTFOLIO_ID: Record<string, Exclude<SourceFilter, 'all'>> = {
+  smart_buy: 'smartBuy',
+  technical_sustained: 'technicalSustained',
+  crypto: 'crypto',
 }
 
 function bucketOfTags(tags: string[] | null | undefined): 'smartBuy' | 'technicalSustained' {
   return tags && tags.includes('smart_buy') ? 'smartBuy' : 'technicalSustained'
+}
+
+// Crypto plans never carry a "crypto" source_tags entry (see PaperTrading.tsx's
+// identical helper for why) — prefer the authoritative portfolio_id when present.
+function filterKeyOf(item: { portfolio_id?: string; source_tags?: string[] | null }): Exclude<SourceFilter, 'all'> {
+  if (item.portfolio_id && FILTER_FOR_PORTFOLIO_ID[item.portfolio_id]) {
+    return FILTER_FOR_PORTFOLIO_ID[item.portfolio_id]
+  }
+  return bucketOfTags(item.source_tags)
 }
 
 function fmtTime(ts: number | null): string {
@@ -169,7 +185,7 @@ export default function TradePlans() {
   const openCount = plans.filter((p) => p.status === 'open').length
   const displayedPlans = sourceFilter === 'all'
     ? plans
-    : plans.filter((p) => bucketOfTags(p.source_tags) === sourceFilter)
+    : plans.filter((p) => filterKeyOf(p) === sourceFilter)
   const bucket = stats ? stats[sourceFilter] : null
 
   return (
@@ -194,7 +210,7 @@ export default function TradePlans() {
       {error && <div className="error-banner">{error}</div>}
 
       <div className="controls" style={{ marginBottom: 10 }}>
-        {(['all', 'smartBuy', 'technicalSustained'] as SourceFilter[]).map((f) => (
+        {(['all', 'smartBuy', 'technicalSustained', 'crypto'] as SourceFilter[]).map((f) => (
           <button key={f} className={sourceFilter === f ? 'primary' : ''}
             onClick={() => setSourceFilter(f)}>
             {SOURCE_FILTER_LABELS[f]}
@@ -492,6 +508,7 @@ export default function TradePlans() {
                         <span>
                           Bucket totals: Smart Buy <strong style={{ color: '#c9d1d9' }}>{fmtUsd(r.bucket_totals.smart_buy)}</strong>
                           {' · '}Technical/Sustained <strong style={{ color: '#c9d1d9' }}>{fmtUsd(r.bucket_totals.technical_sustained)}</strong>
+                          {' · '}Crypto <strong style={{ color: '#c9d1d9' }}>{fmtUsd(r.bucket_totals.crypto)}</strong>
                         </span>
                       )}
                     </div>

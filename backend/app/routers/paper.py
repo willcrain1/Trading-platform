@@ -179,9 +179,16 @@ def auto_deploy(req: AutoDeployRequest):
         except Exception as e:
             return {"strategy": strategy_id, "error": str(e), "sharpe": None}
 
+    # Skip strategies that internally cross-reference an equity-specific instrument
+    # (SPY/VIX/TLT) — economically meaningless for a crypto symbol, so never worth
+    # backtesting (or risk picking as "best") for the crypto portfolio.
+    strategy_ids = backtest.STRATEGIES.keys()
+    if req.portfolioId == store.BUCKET_CRYPTO:
+        strategy_ids = [sid for sid in strategy_ids if sid not in backtest.CRYPTO_INCOMPATIBLE_STRATEGIES]
+
     all_results: list[dict] = []
     with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_try, sid): sid for sid in backtest.STRATEGIES}
+        futures = {ex.submit(_try, sid): sid for sid in strategy_ids}
         for fut in as_completed(futures):
             all_results.append(fut.result())
     all_results.sort(key=lambda r: r.get("strategy", ""))
@@ -525,17 +532,20 @@ def _bucket_stats_with_performance(closed: list[dict], unrealized_pnl: float,
 @router.get("/stats")
 def paper_stats():
     """Realized-trade stats broken out by portfolio (all / Smart Buy /
-    Technical+Sustained), plus unrealized P&L on currently open positions per portfolio.
+    Technical+Sustained / Crypto), plus unrealized P&L on currently open positions
+    per portfolio.
 
     Sharpe/drawdown/CAGR prefer each portfolio's own real equity curve once it has
     enough history (see _real_portfolio_performance), falling back to the
     compounded-closed-trade-returns proxy (_bucket_performance) until then — the
-    "all" bucket spans two portfolios so it always uses the trade-based proxy, since
-    there's no single combined equity curve to draw from.
+    "all" bucket spans every portfolio so it always uses the trade-based proxy,
+    since there's no single combined equity curve to draw from.
     """
     all_closed = store.list_plans(status="closed", limit=500)
 
-    by_bucket: dict[str, list[dict]] = {store.BUCKET_SMART_BUY: [], store.BUCKET_TECHNICAL_SUSTAINED: []}
+    by_bucket: dict[str, list[dict]] = {
+        store.BUCKET_SMART_BUY: [], store.BUCKET_TECHNICAL_SUSTAINED: [], store.BUCKET_CRYPTO: [],
+    }
     for p in all_closed:
         pid = p.get("portfolio_id") or store.bucket_of_tags(p.get("source_tags"))
         by_bucket.setdefault(pid, []).append(p)
@@ -557,5 +567,9 @@ def paper_stats():
         "technicalSustained": _bucket_stats_with_performance(
             by_bucket.get(store.BUCKET_TECHNICAL_SUSTAINED, []), unrealized.get(store.BUCKET_TECHNICAL_SUSTAINED, 0.0),
             portfolio_id=store.BUCKET_TECHNICAL_SUSTAINED,
+        ),
+        "crypto": _bucket_stats_with_performance(
+            by_bucket.get(store.BUCKET_CRYPTO, []), unrealized.get(store.BUCKET_CRYPTO, 0.0),
+            portfolio_id=store.BUCKET_CRYPTO,
         ),
     }

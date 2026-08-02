@@ -613,6 +613,7 @@ export default function Screener() {
           style={{ fontSize: 12 }}>
           <option value="smart_buy">Smart Buy</option>
           <option value="technical_sustained">Technical/Sustained</option>
+          <option value="crypto">Crypto</option>
         </select>
         <button className="primary" onClick={doDeploy}
           disabled={deploying} style={{ fontSize: 12, padding: '3px 8px' }}>

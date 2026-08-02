@@ -212,6 +212,7 @@ export interface PaperInstance {
   params: Record<string, number>
   allocation_usd: number
   enabled: boolean
+  portfolio_id?: string
   source_tags?: string[]
   selection_thesis?: string | null
   selection_snapshot?: SelectionSnapshot | null
@@ -276,12 +277,13 @@ export interface AutoSelectRunLogEntry {
   cash: number | null
   selections: AutoSelectSelection[]
   errors: string[]
-  bucket_totals: { smart_buy: number; technical_sustained: number } | null
+  bucket_totals: { smart_buy: number; technical_sustained: number; crypto: number } | null
 }
 
 export interface PaperPlan {
   id: number
   instance_id: number | null
+  portfolio_id?: string
   symbol: string
   entry_order_id: number
   qty: number
@@ -333,6 +335,7 @@ export interface PaperStats {
   all: PaperStatsBucket
   smartBuy: PaperStatsBucket
   technicalSustained: PaperStatsBucket
+  crypto: PaperStatsBucket
 }
 
 export interface BatchCell {

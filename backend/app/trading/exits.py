@@ -23,8 +23,12 @@ from .broker import OrderRejected, get_active_broker
 log = logging.getLogger("paper.exits")
 
 
-def _held_trading_days(opened_at: float) -> int:
+def _held_trading_days(opened_at: float, calendar_days: bool = False) -> int:
+    """Days held for the time-stop. Crypto trades 24/7, so a business-day count would
+    undercount real elapsed exposure across a weekend — use calendar days for it."""
     opened = datetime.fromtimestamp(opened_at).date()
+    if calendar_days:
+        return (date.today() - opened).days
     return int(np.busday_count(opened, date.today()))
 
 
@@ -61,7 +65,9 @@ def _breach(plan: dict, last: float) -> tuple[str, str] | None:
                 f" (entry {entry:.2f})"
             )
 
-    held = _held_trading_days(plan["opened_at"])
+    held = _held_trading_days(
+        plan["opened_at"], calendar_days=plan.get("portfolio_id") == store.BUCKET_CRYPTO
+    )
     if held >= plan["max_hold_days"]:
         return "time_stop", (
             f"time-stop expired: held {held} trading days >= max {plan['max_hold_days']}"
@@ -70,14 +76,20 @@ def _breach(plan: dict, last: float) -> tuple[str, str] | None:
     return None
 
 
-def check_exits(record_run: bool = True) -> dict:
+def check_exits(record_run: bool = True, portfolio_ids: list[str] | None = None) -> dict:
     """Check every open plan; sell and close any that breached a level.
 
     Records a run row (kind='stops') only when something fired or errored,
-    so the twice-per-hour no-op checks don't drown the run log.
+    so the twice-per-hour no-op checks don't drown the run log. portfolio_ids
+    optionally scopes the sweep to specific portfolios (used by the 24/7
+    crypto exit cadence so it doesn't redundantly re-check equity plans that
+    the market-hours sweep already covers) — None checks everything.
     """
     exited, errors = [], []
-    for plan in store.open_plans():
+    plans = store.open_plans()
+    if portfolio_ids is not None:
+        plans = [p for p in plans if p.get("portfolio_id") in portfolio_ids]
+    for plan in plans:
         symbol = plan["symbol"]
         try:
             last = client.get_quote(symbol)["last"]

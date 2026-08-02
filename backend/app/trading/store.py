@@ -21,14 +21,19 @@ STARTING_CASH = 20_000.0
 # out of sync between auto_selector.py and the stats/filtering endpoints.
 BUCKET_SMART_BUY           = "smart_buy"
 BUCKET_TECHNICAL_SUSTAINED = "technical_sustained"
+BUCKET_CRYPTO              = "crypto"
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
 
 def bucket_of_tags(tags: list[str] | None) -> str:
-    """Classify instance/plan source_tags into the two balance buckets: Smart Buy vs
-    everything else (technical/sustained/congress/smart_universe)."""
+    """Classify instance/plan source_tags into the balance buckets: Smart Buy, Crypto,
+    or everything else (technical/sustained/congress/smart_universe). Fallback path
+    only — callers that create instances/plans normally stamp portfolio_id explicitly
+    at creation time, so this is just a safety net if that's ever skipped."""
+    if tags and "crypto" in tags:
+        return BUCKET_CRYPTO
     return BUCKET_SMART_BUY if tags and "smart_buy" in tags else BUCKET_TECHNICAL_SUSTAINED
 
 _SCHEMA = """
@@ -273,6 +278,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 " VALUES (?, ?, 0, 0, ?, 1)",
                 (pid, label, time.time()),
             )
+
+    # Crypto has no pooled trading history to carve up (it's a genuinely new
+    # strategy), so unlike the two buckets above it gets the real $10,000
+    # baseline immediately instead of a zero placeholder awaiting a seeding script.
+    if conn.execute("SELECT 1 FROM portfolios WHERE id = ?", (BUCKET_CRYPTO,)).fetchone() is None:
+        conn.execute(
+            "INSERT INTO portfolios (id, label, cash, starting_cash, starting_equity, created_at, enabled)"
+            " VALUES (?, ?, ?, ?, ?, ?, 1)",
+            (BUCKET_CRYPTO, "Crypto", DEFAULT_PORTFOLIO_STARTING_CASH, DEFAULT_PORTFOLIO_STARTING_CASH,
+             DEFAULT_PORTFOLIO_STARTING_CASH, time.time()),
+        )
     conn.commit()
 
 

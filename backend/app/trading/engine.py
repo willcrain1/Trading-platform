@@ -38,6 +38,23 @@ STOP_ATR_MULT = 2.0
 TARGET_ATR_MULT = 3.0
 DEFAULT_MAX_HOLD_DAYS = 60
 
+# Equities size in whole shares; crypto sizes fractionally, since a single coin
+# can be worth tens of thousands of dollars and most allocations buy a fraction
+# of one. 6 decimals matches the precision store.py already uses for position
+# qty (get_positions()).
+_CRYPTO_QTY_DECIMALS = 6
+_CRYPTO_MIN_QTY = 1e-6
+
+
+def _round_qty(raw_qty: float, portfolio_id: str) -> float:
+    if portfolio_id == store.BUCKET_CRYPTO:
+        return round(raw_qty, _CRYPTO_QTY_DECIMALS)
+    return float(math.floor(raw_qty))
+
+
+def _min_qty(portfolio_id: str) -> float:
+    return _CRYPTO_MIN_QTY if portfolio_id == store.BUCKET_CRYPTO else 1.0
+
 
 def _desired_position(instance: dict) -> tuple[float, dict]:
     """Run the strategy on latest daily bars; return (desired, signal context).
@@ -198,10 +215,10 @@ def evaluate_instance(instance: dict, run_kind: str) -> dict:
         price = client.get_quote(symbol)["last"]
         if not price or price <= 0:
             raise ValueError(f"no quote for {symbol}")
-        qty = math.floor(instance["allocation_usd"] / price)
-        if qty < 1:
+        qty = _round_qty(instance["allocation_usd"] / price, portfolio_id)
+        if qty < _min_qty(portfolio_id):
             raise ValueError(
-                f"allocation ${instance['allocation_usd']:,.0f} buys less than 1 share of {symbol}"
+                f"allocation ${instance['allocation_usd']:,.0f} buys less than {_min_qty(portfolio_id)} of {symbol}"
             )
 
     order_id = store.create_order(
@@ -225,8 +242,8 @@ def evaluate_instance(instance: dict, run_kind: str) -> dict:
         store.set_order_status(order_id, "vetoed")
         return {"symbol": symbol, "action": "vetoed", "orderId": order_id}
 
-    sized_qty = abs(held) if side in ("sell", "cover") else max(math.floor(qty * verdict["sizeFactor"]), 0)
-    if sized_qty < 1:
+    sized_qty = abs(held) if side in ("sell", "cover") else max(_round_qty(qty * verdict["sizeFactor"], portfolio_id), 0.0)
+    if sized_qty < _min_qty(portfolio_id):
         store.set_order_status(order_id, "vetoed", note="sized to zero by analyst")
         return {"symbol": symbol, "action": "vetoed", "orderId": order_id}
 
@@ -271,17 +288,22 @@ def evaluate_instance(instance: dict, run_kind: str) -> dict:
             "direction": direction, **fill}
 
 
-def run_engine(run_kind: str) -> dict:
-    """Evaluate all enabled instances. run_kind: close | open | manual.
+def run_engine(run_kind: str, portfolio_ids: list[str] | None = None) -> dict:
+    """Evaluate all enabled instances. run_kind: close | open | manual | crypto.
 
     Enforces stops/targets/time-stops on open plans first, then evaluates
-    new signals."""
+    new signals. portfolio_ids optionally scopes the run to specific
+    portfolios (used by the 24/7 crypto cadence so it doesn't redundantly
+    re-evaluate equity instances on every tick) — None evaluates everything,
+    unchanged from the original behavior."""
     run_id = store.start_run(run_kind)
-    exit_result = exits.check_exits(record_run=False)
+    exit_result = exits.check_exits(record_run=False, portfolio_ids=portfolio_ids)
     proposed = filled = vetoed = 0
     results, errors = [], list(exit_result["errors"])
     for instance in store.list_instances():
         if not instance["enabled"]:
+            continue
+        if portfolio_ids is not None and instance.get("portfolio_id") not in portfolio_ids:
             continue
         try:
             res = evaluate_instance(instance, run_kind)
@@ -296,10 +318,15 @@ def run_engine(run_kind: str) -> dict:
     proposed += len(exit_result["exited"])
     filled += len(exit_result["exited"])
 
-    # Mark every portfolio to market — cheap (a handful of portfolios), and simpler
-    # and more robust than tracking exactly which ones this specific run touched.
+    # Mark every in-scope portfolio to market — cheap (a handful of portfolios), and
+    # simpler and more robust than tracking exactly which ones this run touched.
+    # Scoped too, so a crypto-cadence tick doesn't write redundant equity_snapshot
+    # rows for portfolios it never touched.
+    portfolios = store.list_portfolios()
+    if portfolio_ids is not None:
+        portfolios = [p for p in portfolios if p["id"] in portfolio_ids]
     portfolios_mtm: dict[str, dict] = {}
-    for p in store.list_portfolios():
+    for p in portfolios:
         mtm = get_active_broker(p["id"]).mark_to_market()
         portfolios_mtm[p["id"]] = {"equity": mtm["equity"], "cash": mtm["cash"]}
 

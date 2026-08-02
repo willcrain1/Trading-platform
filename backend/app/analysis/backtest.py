@@ -330,6 +330,15 @@ def _strat_dual_momentum_bond(df: pd.DataFrame, p: dict) -> pd.Series:
         return abs_mom.astype(float)
 
 
+# Strategies that internally cross-reference an equity-specific instrument (SPY for
+# relative momentum, ^VIX for regime filtering, TLT for bond rotation) — economically
+# meaningless for a crypto symbol, so excluded from auto-deploy's "try every strategy,
+# pick the best backtest" loop when the target portfolio is crypto.
+CRYPTO_INCOMPATIBLE_STRATEGIES = {
+    "dual_momentum", "dual_momentum_bond", "sma_bond_rotate",
+    "rsi_revert_vix", "bollinger_vix",
+}
+
 # ── Strategy registry ─────────────────────────────────────────────────────────
 # maxHoldDays: default time-stop for trade plans (trading days).
 # Trend strategies get room to run; mean-reversion trades should resolve quickly.

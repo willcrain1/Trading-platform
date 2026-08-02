@@ -27,14 +27,21 @@ Position sizing
 
 Portfolios
 ──────────
-  Each strategy bucket (Smart Buy, Technical/Sustained) has its own real
-  capital pool and equity curve (see store.py's portfolios table) — no
+  Each strategy bucket (Smart Buy, Technical/Sustained, Crypto) has its own
+  real capital pool and equity curve (see store.py's portfolios table) — no
   cross-bucket interleaving/balancing is needed since one bucket can never
   compete with another for the same dollars. Every candidate is tagged with
   its target portfolioId at gather time (_gather_candidates), and selection/
   sizing/cash-headroom checks run independently per portfolio. A symbol can
   be held independently by more than one portfolio at once — see
   routers/paper.py's overlap endpoint for cross-portfolio visibility.
+
+  Crypto doesn't get its own signal source — Sources 1/2 (technical score,
+  sustained streak) already work off whatever's in the scan watchlist, so a
+  crypto symbol scanned there produces a candidate exactly like an equity
+  one. The only difference is which portfolio it's routed to, decided by
+  CRYPTO_SYMBOLS / _portfolio_for() at gather time. Source 3 (smart buy)
+  never applies to crypto — congressional trade disclosures don't cover it.
 """
 from __future__ import annotations
 
@@ -69,6 +76,22 @@ SMART_BUY_RSI_ENTRY      = 45    # rsi_revert buyBelow for Smart Buy instances (
 SMART_BUY_OPTIONS_BONUS  = 1.0   # composite-score bonus when the qualifying politician bought via
                                   # options rather than shares — a leveraged, time-bound bet is a
                                   # stronger conviction signal than a plain stock purchase
+
+# Validated against client.get_history() at build time — every symbol below returned
+# 180+ daily bars over a 6mo window. A few originally-proposed tickers (MATIC-USD,
+# UNI-USD, APT-USD) had no accessible Yahoo/Polygon data and were dropped.
+CRYPTO_SYMBOLS = {
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "ADA-USD", "DOGE-USD",
+    "AVAX-USD", "DOT-USD", "LINK-USD", "LTC-USD", "BCH-USD", "ATOM-USD", "XLM-USD",
+    "ETC-USD", "FIL-USD", "ARB-USD", "OP-USD", "NEAR-USD", "ICP-USD", "HBAR-USD",
+    "ALGO-USD", "AAVE-USD", "MKR-USD", "SAND-USD", "TRX-USD", "INJ-USD",
+}
+
+
+def _portfolio_for(symbol: str) -> str:
+    """Which portfolio a technical/sustained candidate belongs to. Smart Buy is never
+    the default here — it's only ever assigned by Source 3 overriding this."""
+    return store.BUCKET_CRYPTO if symbol in CRYPTO_SYMBOLS else store.BUCKET_TECHNICAL_SUSTAINED
 
 # ── module-level result cache (for the status endpoint) ───────────────────────
 _last_result: dict = {}
@@ -110,7 +133,7 @@ def _pick_strategy(signal_type: str, rsi: float | None) -> str:
 def _existing_bucket_allocation() -> dict[str, float]:
     """Dollar allocation currently committed to enabled instances, split by portfolio
     — informational, surfaced in the auto-select journal."""
-    totals = {store.BUCKET_SMART_BUY: 0.0, store.BUCKET_TECHNICAL_SUSTAINED: 0.0}
+    totals = {p["id"]: 0.0 for p in store.list_portfolios()}
     for inst in store.list_instances():
         if not inst["enabled"]:
             continue
@@ -296,7 +319,7 @@ def _gather_candidates() -> list[dict]:
             "techScore":   r["score"],
             "streak":      0,
             "smartBuy":    False,
-            "portfolioId": store.BUCKET_TECHNICAL_SUSTAINED,
+            "portfolioId": _portfolio_for(sym),
             "rsi":         r["rsi"],
             "atrPct":      r["atr_pct"],
             "lastPrice":   r["last_price"],
@@ -332,7 +355,7 @@ def _gather_candidates() -> list[dict]:
                 "techScore":  latest["score"],
                 "streak":     streak,
                 "smartBuy":   False,
-                "portfolioId": store.BUCKET_TECHNICAL_SUSTAINED,
+                "portfolioId": _portfolio_for(sym),
                 "rsi":        None,
                 "atrPct":     None,
                 "lastPrice":  None,
@@ -466,15 +489,17 @@ def _record_journal(run_kind: str, result: dict) -> None:
         log.exception("auto-selector: failed to record journal entry")
 
 
-def run_auto_selection(run_kind: str = "auto") -> dict:
+def run_auto_selection(run_kind: str = "auto", portfolio_ids: list[str] | None = None) -> dict:
     """Select candidates, create instances, fire engine. Called by scheduler.
 
     Every invocation writes a journal entry (store.auto_select_runs, surfaced in the
     Trade Journal) recording what happened and why — including skipped or empty
-    cycles, not just successful picks.
+    cycles, not just successful picks. portfolio_ids optionally scopes the whole
+    cycle to specific portfolios (used by the 24/7 crypto cadence so it doesn't
+    redundantly re-run equity selection on every tick) — None runs every portfolio.
     """
     global _last_result
-    result = _select_and_trade(run_kind)
+    result = _select_and_trade(run_kind, portfolio_ids)
     _last_result = result
     _record_journal(run_kind, result)
     return result
@@ -588,7 +613,7 @@ def _select_for_portfolio(portfolio_id: str, candidates: list[dict], errors: lis
     }
 
 
-def _select_and_trade(run_kind: str) -> dict:
+def _select_and_trade(run_kind: str, portfolio_ids: list[str] | None = None) -> dict:
     ts = time.time()
     errors: list[str] = []
 
@@ -599,6 +624,8 @@ def _select_and_trade(run_kind: str) -> dict:
     candidates.sort(key=_candidate_score, reverse=True)
 
     portfolios = store.list_portfolios()
+    if portfolio_ids is not None:
+        portfolios = [p for p in portfolios if p["id"] in portfolio_ids]
     selections: list[dict] = []
     per_portfolio: dict[str, dict] = {}
     for p in portfolios:
@@ -618,7 +645,7 @@ def _select_and_trade(run_kind: str) -> dict:
     engine_result: dict = {}
     if selections:
         try:
-            engine_result = run_engine(run_kind)
+            engine_result = run_engine(run_kind, portfolio_ids=portfolio_ids)
         except Exception as e:
             errors.append(f"engine run: {e}")
             log.exception("auto-selector engine run failed")

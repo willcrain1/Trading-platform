@@ -35,7 +35,7 @@ const SOURCE_LABELS: Record<string, string> = {
   congress:       'Congress',
 }
 
-type SourceFilter = 'all' | 'smartBuy' | 'technicalSustained'
+type SourceFilter = 'all' | 'smartBuy' | 'technicalSustained' | 'crypto'
 type PositionSortKey = 'symbol' | 'qty' | 'avgCost' | 'last' | 'pctChg' | 'stopLoss' | 'takeProfit' | 'value' | 'unrealizedPnl'
 type SortDir = 'asc' | 'desc'
 
@@ -53,15 +53,34 @@ const SOURCE_FILTER_LABELS: Record<SourceFilter, string> = {
   all: 'All sources',
   smartBuy: 'Smart Buy',
   technicalSustained: 'Technical/Sustained',
+  crypto: 'Crypto',
 }
 
 const PORTFOLIO_ID_FOR_FILTER: Record<Exclude<SourceFilter, 'all'>, string> = {
   smartBuy: 'smart_buy',
   technicalSustained: 'technical_sustained',
+  crypto: 'crypto',
+}
+
+const FILTER_FOR_PORTFOLIO_ID: Record<string, Exclude<SourceFilter, 'all'>> = {
+  smart_buy: 'smartBuy',
+  technical_sustained: 'technicalSustained',
+  crypto: 'crypto',
 }
 
 function bucketOfTags(tags: string[] | null | undefined): 'smartBuy' | 'technicalSustained' {
   return tags && tags.includes('smart_buy') ? 'smartBuy' : 'technicalSustained'
+}
+
+// Crypto instances/plans never carry a "crypto" source_tags entry (their sources are
+// still "technical"/"sustained" — only the portfolio differs), so tag-guessing alone
+// can't tell them apart from equity ones. Prefer the authoritative portfolio_id field
+// when present; bucketOfTags is only a fallback for older rows that predate it.
+function filterKeyOf(item: { portfolio_id?: string; source_tags?: string[] | null }): Exclude<SourceFilter, 'all'> {
+  if (item.portfolio_id && FILTER_FOR_PORTFOLIO_ID[item.portfolio_id]) {
+    return FILTER_FOR_PORTFOLIO_ID[item.portfolio_id]
+  }
+  return bucketOfTags(item.source_tags)
 }
 
 // Merges multiple portfolios' equity curves into one combined series by
@@ -356,7 +375,7 @@ export default function PaperTrading() {
     return mul * (na - nb)
   })
   const displayedInstances = instances.filter((i) =>
-    sourceFilter === 'all' || bucketOfTags(i.source_tags) === sourceFilter,
+    sourceFilter === 'all' || filterKeyOf(i) === sourceFilter,
   )
   const togglePosSort = (key: PositionSortKey) =>
     setPosSort((s) => s.key === key ? { key, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { key, dir: 'desc' })
@@ -593,7 +612,7 @@ export default function PaperTrading() {
       )}
 
       <div className="controls" style={{ marginBottom: 10 }}>
-        {(['all', 'smartBuy', 'technicalSustained'] as SourceFilter[]).map((f) => (
+        {(['all', 'smartBuy', 'technicalSustained', 'crypto'] as SourceFilter[]).map((f) => (
           <button key={f} className={sourceFilter === f ? 'primary' : ''}
             onClick={() => {
               setSourceFilter(f)
@@ -710,8 +729,8 @@ export default function PaperTrading() {
                   ? Object.entries(account.portfolios).map(([pid, p]) => (
                       <option key={pid} value={pid}>{p.label ?? pid}</option>
                     ))
-                  : (['smart_buy', 'technical_sustained'] as const).map((pid) => (
-                      <option key={pid} value={pid}>{SOURCE_FILTER_LABELS[pid === 'smart_buy' ? 'smartBuy' : 'technicalSustained']}</option>
+                  : (['smart_buy', 'technical_sustained', 'crypto'] as const).map((pid) => (
+                      <option key={pid} value={pid}>{SOURCE_FILTER_LABELS[FILTER_FOR_PORTFOLIO_ID[pid]]}</option>
                     ))}
               </select>
               <Tip text="Which portfolio's own cash this new instance draws from. Portfolios are fully independent — capital, positions, and P&L never cross over between them." />
