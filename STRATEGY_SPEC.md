@@ -16,7 +16,7 @@ At a high level, this is a **fully automated paper-trading loop running three in
 | **Watchlist scanner** | `routers/scan.py` | Runs `compute_signals()` against the watchlist (66 symbols: equities + 27 crypto tickers) on a schedule, turns the result into an integer **technical score** (§4), and persists it to `scan_history` — the raw material for both the Technical and Sustained signal sources, for every portfolio. |
 | **Congress data pipeline** | `data/congress.py`, `routers/congress.py` | Tracks politician trades, computes each politician's historical win rate, rolls that up per-ticker into a **quality tier** (sharp/mixed/weak), and flags **contrarian "smart buy"** tickers. Equity-only — crypto isn't covered by congressional disclosures. |
 | **Auto-selector** | `trading/auto_selector.py` | The orchestration brain. Gathers candidates from all signal sources (§3), ranks them, tags each with its target `portfolioId` at gather time, sizes positions by ATR-based risk (§7) against **that portfolio's own** equity/cash, and creates strategy instances — fully independent per portfolio, no cross-portfolio balancing. |
-| **Strategy functions** | `analysis/backtest.py` | Pure functions that turn a bar history into a desired position (long/flat/short) for one instance. 22 strategies total; 5 that cross-reference SPY/VIX/TLT are excluded from the crypto portfolio (§6). |
+| **Strategy functions** | `analysis/backtest.py` | Pure functions that turn a bar history into a desired position (long/flat/short) for one instance. 23 strategies total (including a rule-validated Elliott Wave pattern detector); 5 that cross-reference SPY/VIX/TLT are excluded from the crypto portfolio (§6). |
 | **Analyst (AI risk gate)** | `trading/analyst.py` | A real LLM call that reviews every proposed order — macro context, dealer gamma positioning, **the proposing instance's own portfolio state** (not the whole account) — and can veto it, shrink its size, or adjust its stop/target within sanity bounds. Fails open (auto-approves) if the CLI is unavailable. |
 | **Engine** | `trading/engine.py` | Diffs each instance's desired position against what's actually held **within its own portfolio**, sizes the order (whole shares for equities, fractional for crypto — §7/§9), routes through the analyst, submits fills to that portfolio's broker, and opens/closes trade-plan records. |
 | **Mechanical exits** | `trading/exits.py` | A separate, tighter-cadence sweep that enforces stop-loss/take-profit/time-stop with no analyst involvement, scoped per portfolio — deliberately ungated so risk-reducing exits are never delayed by an AI call. |
@@ -246,7 +246,7 @@ This math is asset-agnostic — it runs identically on crypto's 7-day-a-week dai
 
 ## 6. Strategy Functions (`backtest.py`)
 
-Strategies operate on 2 years of daily bars. **Signal is computed on the close of bar N; the resulting position is intended to be executed at the close of bar N+1** (no look-ahead). `pos_series.iloc[-1]` (the latest value) is what the engine reads to determine desired position. 22 strategies total.
+Strategies operate on 2 years of daily bars. **Signal is computed on the close of bar N; the resulting position is intended to be executed at the close of bar N+1** (no look-ahead). `pos_series.iloc[-1]` (the latest value) is what the engine reads to determine desired position. 23 strategies total.
 
 ### `ema_cross_9_21` — "EMA cross (9/21)"
 ```python
@@ -269,6 +269,35 @@ position = position.forward_fill().fillna(0)   # holds prior state between trigg
 - `maxHoldDays`: 20.
 - **Smart Buy override**: `buyBelow` is loosened from 30 to **45** for Smart Buy instances specifically (`SMART_BUY_RSI_ENTRY = 45`) — the contrarian thesis is congressional conviction, not a second oversold trigger stacked on top, so entry is loosened to convert more candidates into actual filled positions.
 
+### `elliott_wave` — "Elliott Wave (wave 3 entry)" (`analysis/elliott.py`)
+
+The one strategy in the registry that isn't a simple vectorized indicator — it's a discrete, rule-validated pattern detector. Elliott Wave is inherently subjective (professional analysts disagree on the count for the same chart), so this is a heuristic: **hard structural rules reject a count outright**, **Fibonacci-ratio guidelines only score and rank the survivors**. Every API response and the strategy's own behavior carry that caveat forward — this is one plausible count, not an authoritative read.
+
+```mermaid
+flowchart TD
+    A["zigzag(candles, atrMult=2.5)\nATR-scaled swing detector"] --> B["Ordered, alternating pivots\n{time, price, type, confirmedAt}"]
+    B --> C{"label_waves():\ntry recent 6-pivot windows\n(most recent first)"}
+    C --> D{"Hard rules —\nreject if violated"}
+    D -->|"wave2 retraces\npast wave1 start"| Z[Rejected]
+    D -->|"wave4 overlaps\nwave1 territory"| Z
+    D -->|"wave3 is the\nshortest of 1/3/5"| Z
+    D -->|passes| E["Fibonacci scoring:\nwave2 retrace 50-78.6%,\nwave4 retrace 23.6-38.2%,\nwave3/wave5 extension zones"]
+    E --> F["confidence 0-100"]
+    C -->|"pivots 0-3 valid,\nlive price extends\npast pivot 4"| G["Wave 5 in progress\n(unconfirmed)"]
+    G --> H["projectedTarget =\nwave4 + wave1 length"]
+    F --> I["Backtest strategy:\nenter on waves 1-2 confirmed\n(anticipating wave 3)"]
+    G --> I
+    I --> J["Hold through wave 3-4"]
+    J --> K{"Exit trigger"}
+    K -->|"wave4 later overlaps\nwave1 — invalidated"| L[Flatten]
+    K -->|"wave5 confirms —\nimpulse exhausted"| L
+```
+
+- **`zigzag()`** is causal by construction: a pivot is only emitted once price has actually reversed past it by `atrMult × ATR(14)` — `confirmedAt` (the bar where that reversal crossed threshold) is tracked separately from the pivot's own extreme bar, so the backtest strategy below can walk the list bar-by-bar with no look-ahead.
+- **Search order**: an in-progress wave 5 at the current tail is checked first (most actionable — "we're in the middle of something now"); failing that, the search slides backward through completed 6-pivot windows and takes the most recent one that validates, since real price data is choppy and the single most-recent window rarely forms a clean textbook impulse.
+- **As a strategy**: walks confirmed pivots chronologically, entering (long or short — `supportsShort: True`) once a fresh waves-1-2 setup validates, holding through the anticipated wave 3-4, and flattening on wave-4 invalidation or wave-5 completion. Not excluded from crypto (`CRYPTO_INCOMPATIBLE_STRATEGIES`) — it's pure price-action with no cross-asset reference.
+- **As a standalone analysis view**: `GET /api/ticker/{symbol}/elliott-wave` exposes the same engine for manual chart reading — a toggle on the Ticker Analysis page, off by default, drawing the raw zigzag (muted dashed line), the labeled wave count (colored line + numbered markers), and a projected wave-5 target when applicable.
+
 ### Strategy assignment rule (`auto_selector._pick_strategy`)
 ```python
 if signal_type == "smart_buy":          strategy = "rsi_revert"   (with buyBelow=45)
@@ -278,7 +307,7 @@ else:                                    strategy = "ema_cross_9_21"
 Both auto-selected strategies are pure technical indicators with no cross-asset reference, so this rule needs no crypto-specific branch — auto-selected crypto candidates are strategy-safe automatically.
 
 ### Crypto strategy exclusions (`CRYPTO_INCOMPATIBLE_STRATEGIES`)
-5 of the 22 registered strategies internally fetch an equity-specific instrument and are economically meaningless for a crypto symbol — excluded from the auto-deploy "backtest every strategy, pick the best Sharpe" loop whenever the target portfolio is crypto:
+5 of the 23 registered strategies internally fetch an equity-specific instrument and are economically meaningless for a crypto symbol — excluded from the auto-deploy "backtest every strategy, pick the best Sharpe" loop whenever the target portfolio is crypto:
 
 | Strategy | Cross-references |
 |---|---|
@@ -459,7 +488,7 @@ To rebuild this system from scratch, implement in this order:
 1. **Data layer**: OHLCV history fetch + quote fetch for any symbol (equity or crypto ticker format — same client), with a caching layer.
 2. **Indicators**: RSI(Wilder), ATR(Wilder), MACD, SMA50/200, EMA9/21, Bollinger(20,2) → `compute_signals()`.
 3. **Technical scanner**: run `compute_signals` per watchlist symbol on a schedule, score per §4, persist to a scan-history table.
-4. **Strategy functions**: `ema_cross_9_21` and `rsi_revert` per §6, returning a position series from a bars DataFrame.
+4. **Strategy functions**: `ema_cross_9_21` and `rsi_revert` per §6, returning a position series from a bars DataFrame. **Elliott Wave** (§6): a causal zigzag swing detector, then a rule-validated (hard rules) + Fibonacci-scored (soft ranking) wave-counting pass on top — usable both as a standalone chart-analysis endpoint and as a backtestable strategy.
 5. **Politician/congress data pipeline**: per-politician win rate → per-ticker quality tier (§3c) → smart-buy alert table.
 6. **Portfolio model**: a `portfolios` table (§1) — id/label/cash/starting_cash/starting_equity — and a `portfolio_id` column denormalized onto every instance/order/fill/trade-plan/equity-snapshot table, keyed to composite `(portfolio_id, ts)` for equity snapshots.
 7. **Broker registry**: `PaperBroker(portfolio_id)` per portfolio, cash/position bookkeeping scoped to that portfolio's own fills only (§11).
