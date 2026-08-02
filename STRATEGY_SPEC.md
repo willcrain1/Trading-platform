@@ -1,125 +1,185 @@
 # Paper-Trading Strategy System — Full Specification
 
-This document specifies the complete auto-trading system implemented in `backend/app/trading/` and `backend/app/analysis/`, in enough detail to be re-implemented from scratch. It covers: candidate sourcing, scoring, strategy signals, position sizing, order review, execution, and exit management.
+This document specifies the complete auto-trading system implemented in `backend/app/trading/` and `backend/app/analysis/`, in enough detail to be re-implemented from scratch. It covers: the multi-portfolio account model, candidate sourcing, scoring, strategy signals, position sizing, order review, execution, and exit management.
 
 ---
 
 ## Executive Overview
 
-At a high level, this is a **twice-daily, fully automated paper-trading loop**: it scans a watchlist for setups, cross-references congressional trading activity, sizes and files trades against a $20,000 simulated account, has each trade reviewed by an AI risk analyst before it fills, and then manages every open position mechanically until it exits. No human is in the loop for any individual trade decision — the system runs unattended on a schedule and simply logs its reasoning at every step for later review in the Trade Journal.
+At a high level, this is a **fully automated paper-trading loop running three independent strategy portfolios**: Smart Buy (congressional-trade-driven, contrarian), Technical/Sustained (chart-driven, trend-following), and Crypto (chart-driven, 24/7). Each portfolio has its own real cash balance, its own positions, and its own equity curve — none of them compete for the same dollars, and a symbol can be held independently by more than one portfolio at once. Each scans its own candidate sources for setups, sizes and files trades against its own capital, has each trade reviewed by an AI risk analyst before it fills, and manages every open position mechanically until it exits. No human is in the loop for any individual trade decision — the system runs unattended on a schedule and logs its reasoning at every step for later review in the Trade Journal.
 
 ### The components, and what each one owns
 
 | Component | File(s) | Responsibility |
 |---|---|---|
-| **Data & indicators** | `data/client.py`, `analysis/indicators.py` | Fetches OHLCV bars and quotes; computes RSI, ATR, MACD, SMA/EMA, Bollinger bands, and the derived `compute_signals()` summary (trend, momentum, crosses) that everything downstream reads from. |
-| **Watchlist scanner** | `routers/scan.py` | Runs `compute_signals()` against the watchlist on a schedule, turns the result into an integer **technical score** (§4), and persists it to `scan_history` — the raw material for both the Technical and Sustained signal sources. |
-| **Congress data pipeline** | `data/congress.py`, `routers/congress.py` | Tracks politician trades, computes each politician's historical win rate, rolls that up per-ticker into a **quality tier** (sharp/mixed/weak), and flags **contrarian "smart buy"** tickers where a sharp investor bought against a weak chart. |
-| **Auto-selector** | `trading/auto_selector.py` | The orchestration brain, run at 10:05/16:05 ET. Gathers candidates from all three signal sources (§3), ranks them, sizes positions by ATR-based risk (§7), balances allocation between the Smart Buy and Technical/Sustained buckets, and creates strategy instances. |
-| **Strategy functions** | `analysis/backtest.py` | Pure functions (`ema_cross_9_21`, `rsi_revert`) that turn a bar history into a desired position (long/flat/short) for one instance. |
-| **Analyst (AI risk gate)** | `trading/analyst.py` | A real LLM call (via the local `claude` CLI) that reviews every proposed order — macro context, dealer gamma positioning, portfolio state — and can veto it, shrink its size, or adjust its stop/target within sanity bounds. Fails open (auto-approves) if the CLI is unavailable, so a broken analyst never blocks trading. |
-| **Engine** | `trading/engine.py` | Diffs each instance's desired position against what's actually held, creates and routes orders through the analyst, submits fills to the broker, and opens/closes trade-plan records. |
-| **Mechanical exits** | `trading/exits.py` | A separate, tighter-cadence sweep (every 15 min) that enforces stop-loss/take-profit/time-stop with no analyst involvement — deliberately ungated so risk-reducing exits are never delayed by an AI call. |
-| **Broker** | `trading/broker.py` | The simulated fill engine: instant fills at the latest quote, cash/position bookkeeping, no fees or slippage. Swappable for a real broker via the same interface. |
-| **Scheduler** | `trading/scheduler.py` | Wires all of the above to the clock (§2) — this is the only thing that actually kicks off a cycle; everything else is invoked by it (or manually, via the same entry points). |
-| **Store & reporting** | `trading/store.py`, `routers/paper.py` | SQLite persistence for every order, fill, trade plan, and equity snapshot, plus the Trade Journal's derived stats (win rate, Sharpe, drawdown, annualized return, S&P 500 benchmark — §12). |
+| **Data & indicators** | `data/client.py`, `analysis/indicators.py` | Fetches OHLCV bars and quotes (equities via yfinance/Polygon, crypto via yfinance's `-USD` ticker format — same client, no special-casing) and computes RSI, ATR, MACD, SMA/EMA, Bollinger bands, and the derived `compute_signals()` summary that everything downstream reads from. |
+| **Watchlist scanner** | `routers/scan.py` | Runs `compute_signals()` against the watchlist (66 symbols: equities + 27 crypto tickers) on a schedule, turns the result into an integer **technical score** (§4), and persists it to `scan_history` — the raw material for both the Technical and Sustained signal sources, for every portfolio. |
+| **Congress data pipeline** | `data/congress.py`, `routers/congress.py` | Tracks politician trades, computes each politician's historical win rate, rolls that up per-ticker into a **quality tier** (sharp/mixed/weak), and flags **contrarian "smart buy"** tickers. Equity-only — crypto isn't covered by congressional disclosures. |
+| **Auto-selector** | `trading/auto_selector.py` | The orchestration brain. Gathers candidates from all signal sources (§3), ranks them, tags each with its target `portfolioId` at gather time, sizes positions by ATR-based risk (§7) against **that portfolio's own** equity/cash, and creates strategy instances — fully independent per portfolio, no cross-portfolio balancing. |
+| **Strategy functions** | `analysis/backtest.py` | Pure functions that turn a bar history into a desired position (long/flat/short) for one instance. 22 strategies total; 5 that cross-reference SPY/VIX/TLT are excluded from the crypto portfolio (§6). |
+| **Analyst (AI risk gate)** | `trading/analyst.py` | A real LLM call that reviews every proposed order — macro context, dealer gamma positioning, **the proposing instance's own portfolio state** (not the whole account) — and can veto it, shrink its size, or adjust its stop/target within sanity bounds. Fails open (auto-approves) if the CLI is unavailable. |
+| **Engine** | `trading/engine.py` | Diffs each instance's desired position against what's actually held **within its own portfolio**, sizes the order (whole shares for equities, fractional for crypto — §7/§9), routes through the analyst, submits fills to that portfolio's broker, and opens/closes trade-plan records. |
+| **Mechanical exits** | `trading/exits.py` | A separate, tighter-cadence sweep that enforces stop-loss/take-profit/time-stop with no analyst involvement, scoped per portfolio — deliberately ungated so risk-reducing exits are never delayed by an AI call. |
+| **Broker** | `trading/broker.py` | A `PaperBroker` **per portfolio** (registry keyed by `portfolio_id`, lazily created) — instant fills at the latest quote, cash/position bookkeeping scoped to that portfolio only. Swappable for a real broker via the same interface. |
+| **Scheduler** | `trading/scheduler.py` | Wires all of the above to the clock. Equity portfolios run Mon–Fri on the regular market-hours cadence (§2); Crypto runs on its own 24/7 cadence, scoped so it never redundantly re-touches equity instances. |
+| **Store & reporting** | `trading/store.py`, `routers/paper.py` | SQLite persistence — a `portfolios` table (§1) plus a `portfolio_id` column denormalized onto every instance/order/fill/trade-plan — and the Trade Journal's derived per-portfolio stats (win rate, Sharpe, drawdown, annualized return, S&P 500 benchmark — §12). |
 
 ### How a trade actually happens, end to end
 
 ```mermaid
 flowchart TD
-    A[Scheduler: 10:05 / 16:05 ET] --> B[Watchlist scan\n+ Congress refresh]
+    A[Scheduler: equity Mon-Fri\ncrypto every 4h, 24/7] --> B[Watchlist scan\n+ Congress refresh]
     B --> C{Auto-selector:\ngather candidates}
     C -->|Technical / Sustained| D[Technical score >= 3\nor 3+ scan streak]
     C -->|Smart Buy| E[Score <= -1 AND\nsharp politician buying]
-    D --> F[Rank + ATR-size +\nbucket-balance]
-    E --> F
-    F --> G[Engine: diff desired\nvs held position]
-    G --> H[Analyst review:\napprove / veto / resize]
-    H -->|approved| I[Broker: instant fill\nat latest quote]
-    H -->|vetoed| Z[No trade — logged]
-    I --> J[Trade plan opened:\nstop / target / time-stop]
-    J --> K[Mechanical exit sweep\nevery 15 min]
-    J --> L[Engine re-evaluates signal\nat next 10:05/16:05 run]
-    K -->|breach| M[Closed: stop_loss /\ntake_profit / time_stop]
-    L -->|signal flips off,\nanalyst-reviewed| N[Closed: signal_exit]
-    M --> O[Trade Journal:\nstats, Sharpe, drawdown,\nCAGR, S&P benchmark]
-    N --> O
+    D --> R{symbol in\nCRYPTO_SYMBOLS?}
+    R -->|yes| F2[portfolioId = crypto]
+    R -->|no| F1[portfolioId = technical_sustained]
+    E --> F3[portfolioId = smart_buy\noverrides technical/sustained]
+    F1 --> G[Per-portfolio sizing:\nATR-risk vs THAT portfolio's\nown equity/cash]
+    F2 --> G
+    F3 --> G
+    G --> H[Engine: diff desired\nvs held, within that\nportfolio's own book]
+    H --> I[Analyst review:\napprove / veto / resize]
+    I -->|approved| J["Portfolio's own broker:\ninstant fill (whole shares,\nor fractional qty for crypto)"]
+    I -->|vetoed| Z[No trade — logged]
+    J --> K[Trade plan opened:\nstop / target / time-stop]
+    K --> L["Mechanical exit sweep\n(scoped to that portfolio)"]
+    K --> M[Engine re-evaluates signal\nat that portfolio's next run]
+    L -->|breach| N[Closed: stop_loss /\ntake_profit / time_stop]
+    M -->|signal flips off,\nanalyst-reviewed| O[Closed: signal_exit]
+    N --> P["That portfolio's equity_snapshots\n+ Trade Journal stats"]
+    O --> P
+    P --> Q["/api/paper/account:\ncombined = sum of all portfolios"]
 ```
 
-The two signal sources (Technical/Sustained and Smart Buy) feed the same downstream pipeline but represent opposite theses — one follows the chart, the other deliberately bets against it when a historically sharp politician disagrees with it — which is why they're tracked as separate portfolio buckets throughout sizing, execution, and reporting rather than merged into one undifferentiated trade list. Every other part of the pipeline (analyst review, broker fill, exit management) is shared and source-agnostic. The sections below specify each box in this diagram exactly.
-
-### Performance so far (as of 2026-07-31, ~19 days live)
-
-**Real account equity** — the number that actually matters:
-
-| | Value |
-|---|---|
-| Starting equity | $20,000.00 |
-| Current equity | $20,783.31 |
-| Total account gain | +$783.31 (**+3.92%**) over ~19 days |
-| S&P 500, same window | -1.00% |
-| Outperformance | +4.91 percentage points |
-
-**A data-integrity note, since it materially changed this section:** an audit on 2026-07-30 found two real accounting bugs — (1) `PaperBroker`'s cash update was a non-atomic read-then-write, so two orders filling close together (plausible daily, since `check_exits_intraday` and `paper_open`/`auto_select_open` are scheduled for the same minute) could silently lose part of a cash movement; (2) a "position already gone" fallback in `exits.py` could fabricate or clobber a trade's realized P&L when a plan got evaluated twice by overlapping runs. Together these had suppressed real equity by ~$701.60 (the account was actually performing *better* than it displayed, not worse). Both are now fixed with atomic cash updates and a `status='open'` guard on plan closes (see `store.adjust_cash()`, `close_plan()`, `close_plan_untracked()`); the one affected historical trade and the full equity-snapshot history were corrected to match. The **+3.92%** figure above is the corrected number — pre-fix, this section reported +0.51%.
-
-**Closed-trade stats, by source bucket** (33 closed trades total so far):
-
-| | All | Smart Buy | Technical/Sustained |
-|---|---|---|---|
-| Closed trades | 33 | 21 | 12 |
-| Win rate | 66.7% | 76.2% | 50.0% |
-| Realized P&L | +$835.15 | +$492.30 | +$342.85 |
-| Avg win / avg loss | +5.03% / -5.85% | +4.22% / -7.67% | +7.18% / -4.33% |
-| Profit factor | 2.53 | 3.41 | 2.00 |
-| Sharpe (trade-based, see §12) | 5.96 | 4.61 | 3.63 |
-| Max drawdown | -22.56% | -18.06% | -6.42% |
-| Unrealized P&L (open book) | -$51.87 | -$70.48 | +$18.61 |
-
-Both buckets remain net profitable and both are beating the index at the trade level, still winning in different ways: **Smart Buy** (the `rsi_revert` mean-reversion strategy) wins often and small, with occasional sharp losses (avg loss -7.67% vs. avg win +4.22%). **Technical/Sustained** (`ema_cross_9_21`) wins less often but bigger (avg win +7.18% vs. avg loss -4.33%), with a much calmer drawdown profile. Exit-reason breakdown across all 33 trades: 15 signal exits (net +$272.95), 10 target hits (+$983.83), 8 stop-losses (-$421.63).
-
-**Important caveat — read the trade-level numbers as "the trades that finished," not "portfolio growth":** the 48.82%/28.19%/16.1% "total return" figures (not shown above, see the live `/api/paper/stats` response) compound each closed trade's *percentage* return in sequence, as if 100% of capital rotated through every trade. In reality only 0.5–1% of equity is risked per trade (§7), so those figures measure trade-picking skill, not account growth — which is why real, whole-account equity is up 3.92% while the compounded-trade numbers run much higher. This gap will narrow as a larger share of capital gets deployed and more trades close. The sample is also still small (33 trades, ~19 days) — Sharpe and drawdown numbers this early are noisy and should not be treated as a stable long-run track record. See §12 and §13 for exactly how each figure is computed.
+The three signal sources (Technical/Sustained, Smart Buy, Crypto) feed the same downstream sizing/execution/exit pipeline but never compete for capital — each is tagged with its target portfolio at candidate-gather time and every step from there on (equity/cash check, sizing, order creation, fill, trade-plan lifecycle, equity snapshot) operates against that one portfolio's own state. The sections below specify each box in this diagram exactly, starting with the portfolio model itself.
 
 ---
 
-## 1. Account Model
+## 1. Portfolio Model
 
-- **Starting cash**: $20,000.00 (`STARTING_CASH`).
-- **Equity** = cash + market value of all open positions (marked at latest quote).
-- **Positions**: signed quantity — positive = long, negative = short. Derived from the running sum of fills.
-- **No fees, no commissions, no slippage model.** Orders fill instantly at the last available quote (see §7).
-- An **equity snapshot** (`ts, equity, cash`) is recorded every time `mark_to_market()` runs (i.e., after every fill and at the end of every engine run).
+Three independent portfolios, each with its own cash, positions, and equity curve — no pooled account, no cross-portfolio balancing:
+
+```mermaid
+flowchart TB
+    PT[("portfolios table\nid · label · cash · starting_cash\nstarting_equity · created_at")]
+
+    subgraph SB["smart_buy — \"Smart Buy\""]
+        SBB[PaperBroker instance]
+        SBP["positions\n(derived from own fills only)"]
+        SBE[equity_snapshots\nportfolio_id = smart_buy]
+    end
+
+    subgraph TS["technical_sustained — \"Technical/Sustained\""]
+        TSB[PaperBroker instance]
+        TSP[positions]
+        TSE[equity_snapshots\nportfolio_id = technical_sustained]
+    end
+
+    subgraph CR["crypto — \"Crypto\""]
+        CRB[PaperBroker instance]
+        CRP[positions]
+        CRE[equity_snapshots\nportfolio_id = crypto]
+    end
+
+    PT --> SB
+    PT --> TS
+    PT --> CR
+
+    SB --> ACC["/api/paper/account\ncombined = Σ all portfolios"]
+    TS --> ACC
+    CR --> ACC
+```
+
+- **Equity** = cash + market value of that portfolio's own open positions (marked at latest quote). **Positions** are derived from the running sum of *that portfolio's own* fills only — two portfolios can independently hold the same symbol and never see each other's side of it (see `GET /api/paper/overlap` for cross-portfolio visibility into that).
+- **`starting_cash`** is the pure cash reserve a `reset_portfolio()` call restores cash to. **`starting_equity`** is the day-1 total-value baseline (cash + any carried-over positions) used to measure `totalPnl`/`totalPnlPct` — they diverge when a portfolio is seeded with pre-existing history (Smart Buy and Technical/Sustained were originally split out of one older pooled account; Crypto was not).
+- **No fees, no commissions, no slippage model.** Orders fill instantly at the last available quote (§11).
+- A new portfolio (e.g. a future 4th strategy) defaults to a clean **$10,000** starting balance (`DEFAULT_PORTFOLIO_STARTING_CASH`) unless explicitly seeded otherwise — this is how Crypto was added: `create_portfolio("crypto", "Crypto")`, no history to carve up, no proportional-split math needed.
+- **Combined view** (`/api/paper/account`'s `combined` field): every real number just summed across all three portfolios — equity, cash, positions list, starting values, P&L.
+
+### Bucket classification (`store.py`)
+
+```python
+BUCKET_SMART_BUY           = "smart_buy"
+BUCKET_TECHNICAL_SUSTAINED = "technical_sustained"
+BUCKET_CRYPTO              = "crypto"
+
+def bucket_of_tags(tags):
+    if tags and "crypto" in tags:            return BUCKET_CRYPTO
+    if tags and "smart_buy" in tags:         return BUCKET_SMART_BUY
+    return BUCKET_TECHNICAL_SUSTAINED
+```
+
+This is a **fallback path only** — every instance, order, fill, and trade plan carries an explicit `portfolio_id` column, stamped at creation time by whichever code path created it (the auto-selector, a manual instance-create call, etc.). `bucket_of_tags()` only matters if that ever gets skipped; it's never the primary routing mechanism.
 
 ---
 
 ## 2. Scheduling
 
-All jobs run on an `AsyncIOScheduler` in the `America/New_York` timezone, Monday–Friday, no holiday calendar:
+Equity portfolios (Smart Buy, Technical/Sustained) run on an `AsyncIOScheduler` in `America/New_York`, Monday–Friday, no holiday calendar. Crypto runs on its own 24/7 cadence — every job below is either unscoped (touches every portfolio, unchanged from before the split) or explicitly scoped to `portfolio_ids=["crypto"]` so the two cadences never redundantly re-touch each other's instances:
 
-| Job | Time (ET) | Action |
-|---|---|---|
-| `paper_open` | 10:00 | `run_engine("open")` |
-| `auto_select_open` | 10:05 | refresh smart-buy alerts, then `run_auto_selection("open")` |
-| `paper_close` | 16:00 | `run_engine("close")` |
-| `auto_select_close` | 16:05 | refresh smart-buy alerts, then `run_auto_selection("close")` |
-| `check_exits_intraday` | every 15 min, 9:00–15:45 | mechanical stop/target/time-stop sweep (no-ops outside 9:30–16:00 market hours) |
-| `cot_refresh` | Friday 16:15 | refresh CFTC Commitment-of-Traders cache (unrelated to trading decisions) |
+```mermaid
+flowchart LR
+    subgraph Equity["Equity cadence — Mon-Fri only"]
+        EO["10:00 paper_open\nrun_engine('open')"]
+        EOS["10:05 auto_select_open"]
+        EC["16:00 paper_close\nrun_engine('close')"]
+        ECS["16:05 auto_select_close"]
+        EX["9:00-15:45, every 15min\ncheck_exits_intraday\n(no-op outside 9:30-16:00 ET)"]
+    end
+    subgraph Crypto["Crypto cadence — every day, 24/7"]
+        CE["every 4h :00\ncrypto_engine\nrun_engine('crypto', ['crypto'])"]
+        CES["every 4h :05\ncrypto_auto_select\nrun_auto_selection('crypto', ['crypto'])"]
+        CX["every 30min\ncrypto_exits\ncheck_exits(['crypto'])\nno market-hours gate"]
+    end
+```
 
-A manual "Run Now" (`kind="manual"`) triggers the same `run_engine()` path outside the schedule.
+| Job | Schedule | Scope | Action |
+|---|---|---|---|
+| `paper_open` | Mon–Fri 10:00 ET | all portfolios | `run_engine("open")` |
+| `auto_select_open` | Mon–Fri 10:05 ET | all portfolios | refresh smart-buy alerts, then `run_auto_selection("open")` |
+| `paper_close` | Mon–Fri 16:00 ET | all portfolios | `run_engine("close")` |
+| `auto_select_close` | Mon–Fri 16:05 ET | all portfolios | refresh smart-buy alerts, then `run_auto_selection("close")` |
+| `check_exits_intraday` | Mon–Fri, every 15 min, 9:00–15:45 ET | all portfolios | mechanical sweep (no-ops outside 9:30–16:00 market hours) |
+| `crypto_engine` | every day, every 4h on the hour | `portfolio_ids=["crypto"]` | `run_engine("crypto", ...)` |
+| `crypto_auto_select` | every day, every 4h at :05 | `portfolio_ids=["crypto"]` | `run_auto_selection("crypto", ...)` |
+| `crypto_exits` | every day, every 30 min | `portfolio_ids=["crypto"]` | `check_exits(...)` — no market-hours gate, crypto never closes |
+| `cot_refresh` | Friday 16:15 ET | n/a | refresh CFTC Commitment-of-Traders cache (unrelated to trading decisions) |
+
+The `portfolio_ids` scope filter is an optional parameter on `run_engine()`, `check_exits()`, and `run_auto_selection()` — `None` (the equity jobs' default) evaluates everything, unchanged from before Crypto existed; a scoped call filters `store.list_instances()`/`store.open_plans()`/`store.list_portfolios()` down to just the given portfolio ids before doing anything, including the mark-to-market loop (so a crypto tick doesn't write redundant `equity_snapshot` rows for the untouched equity portfolios).
+
+A manual "Run Now" (`kind="manual"`) triggers the same `run_engine()` path outside the schedule, unscoped (all portfolios).
 
 ---
 
-## 3. Candidate Sourcing (`auto_selector.py`, runs at 10:05/16:05)
+## 3. Candidate Sourcing (`auto_selector.py`)
 
-Three signal sources are gathered and merged by ticker symbol into a candidate dict. A ticker can carry multiple source tags.
+Candidates are gathered and merged by ticker symbol into a candidate dict, each tagged with a target `portfolioId`. A ticker can carry multiple source tags.
+
+```mermaid
+flowchart TD
+    WL[("scan_watchlist\n66 symbols: equities + 27 crypto")] --> SC[scan_history\ntechnical score per symbol]
+    SC -->|score >= 3| TECH[Technical source]
+    SC -->|3+ scan streak| SUS[Sustained source]
+    TECH --> ROUTE{symbol in\nCRYPTO_SYMBOLS?}
+    SUS --> ROUTE
+    ROUTE -->|yes| PC["portfolioId = crypto"]
+    ROUTE -->|no| PT["portfolioId = technical_sustained"]
+    ALERTS[("smart_buy_alerts\ncongress trades — equity only")] --> SB["Smart Buy source\nscore <= -1 AND sharp politician"]
+    SB -->|overrides| PS["portfolioId = smart_buy"]
+    PT -.can be overridden by.-> PS
+```
 
 ### 3a. Technical
-From `scan_history` (the watchlist scanner — see §4 for scoring), tickers scanned in the **last 4 hours** with `score >= TECH_MIN_SCORE (3)`, ordered by score descending, capped at top 30.
+From `scan_history`, tickers scanned in the **last 4 hours** with `score >= TECH_MIN_SCORE (3)`, ordered by score descending, capped at top 30.
 
 ### 3b. Sustained
 From `scan_history` over the **last 90 days**, group by symbol, walk each symbol's scans newest-first and count a **consecutive streak** of scans with `score >= SUSTAINED_MIN_SCORE (2)` (streak breaks on the first scan below threshold). Qualifies if `streak >= SUSTAINED_MIN_STREAK (3)`.
 
-### 3c. Smart Buy (contrarian)
+**Portfolio routing for 3a/3b**: no separate "crypto source" exists — Technical and Sustained already work off whatever's in the watchlist, equity or crypto alike. The only difference is which portfolio the resulting candidate is tagged with: `_portfolio_for(symbol)` returns `BUCKET_CRYPTO` if the symbol is in the validated `CRYPTO_SYMBOLS` set, else `BUCKET_TECHNICAL_SUSTAINED`.
+
+### 3c. Smart Buy (contrarian, equity-only)
 From `smart_buy_alerts`, alerts detected in the **last 30 days** (`SMART_BUY_MAX_DAYS`), deduped by ticker (most recent). An alert exists for a ticker when, at detection time:
 ```
 technical_score <= -1   AND   politician "quality" == "sharp"
@@ -131,14 +191,17 @@ avg_wr >= 65        → "sharp"
 avg_wr < 45          → "weak"
 avg_wr is None       → "unknown"
 ```
-A politician's **effective win-rate** is their `realizedWinRate` (wins / trades on positions actually closed) if they have ≥2 realized trades, else their overall lifetime `winRate`. `investorQualityScore` = the ticker's `avg_wr` (rounded to 1 decimal). `avgAnnualizedGain` = mean of contributing politicians' average annualized returns; `maxAnnualizedGain` = the max across them.
+A politician's **effective win-rate** is their `realizedWinRate` (wins / trades on positions actually closed) if they have ≥2 realized trades, else their overall lifetime `winRate`. `investorQualityScore` = the ticker's `avg_wr` (rounded to 1 decimal). `avgAnnualizedGain` = mean of contributing politicians' average annualized returns; `maxAnnualizedGain` = the max across them. Candidates from this source always get `portfolioId = BUCKET_SMART_BUY`, overriding a Technical/Sustained tag if the symbol also qualified there. This source structurally never applies to crypto — congressional trade disclosures don't cover it.
 
-### 3d. Cross-reference tags (informational, don't gate eligibility)
+### 3d. Cross-reference tags (informational, don't gate eligibility or change portfolio routing)
 - `smart_universe`: ticker appears in the top-2 ranked sectors of the Smart Universe cache.
 - `congress`: added to a **non-smart-buy** candidate if a politician bought it with `maxAnnualizedGain >= CONGRESS_MIN_ANN_RETURN (60.0)` and quality in `{"sharp", "mixed"}`.
 
-### Eligibility filter
-A candidate is dropped if its symbol already has an open trade plan or an enabled instance ("blocked").
+### The crypto universe
+27 validated symbols (`CRYPTO_SYMBOLS` in `auto_selector.py`), seeded into `scan_watchlist` so the periodic scanner keeps their technical scores current: `BTC-USD, ETH-USD, SOL-USD, XRP-USD, BNB-USD, ADA-USD, DOGE-USD, AVAX-USD, DOT-USD, LINK-USD, LTC-USD, BCH-USD, ATOM-USD, XLM-USD, ETC-USD, FIL-USD, ARB-USD, OP-USD, NEAR-USD, ICP-USD, HBAR-USD, ALGO-USD, AAVE-USD, MKR-USD, SAND-USD, TRX-USD, INJ-USD`. Three originally-proposed tickers (`MATIC-USD`, `UNI-USD`, `APT-USD`) had no accessible Yahoo/Polygon data at validation time and were dropped.
+
+### Eligibility filter (per portfolio)
+A candidate is dropped from a given portfolio's selection pass if its symbol already has an open trade plan or an enabled instance **within that same portfolio** — a symbol blocked in one portfolio never blocks another from independently entering it.
 
 ---
 
@@ -167,7 +230,7 @@ Where (from `indicators.py`):
 - **bollingerStretch**: `(close − BB_mid) / (BB_width / 2)`, Bollinger(20, 2.0σ).
 - **atrPct**: `ATR(14) / close × 100`.
 
-This score is recorded to `scan_history` on every scheduled/manual scan and is the sole gate for Technical/Sustained sourcing (§3a/3b) and the sole "weak chart" signal for Smart Buy's contrarian gate (§3c).
+This math is asset-agnostic — it runs identically on crypto's 7-day-a-week daily bars as on equities' 5-day bars; a 50-day SMA is still a 50-day SMA regardless of how many bars a week feed it. This score is recorded to `scan_history` on every scheduled/manual scan and is the sole gate for Technical/Sustained sourcing (§3a/3b) and the sole "weak chart" signal for Smart Buy's contrarian gate (§3c).
 
 ---
 
@@ -183,7 +246,7 @@ This score is recorded to `scan_history` on every scheduled/manual scan and is t
 
 ## 6. Strategy Functions (`backtest.py`)
 
-Strategies operate on 2 years of daily bars. **Signal is computed on the close of bar N; the resulting position is intended to be executed at the close of bar N+1** (no look-ahead). `pos_series.iloc[-1]` (the latest value) is what the engine reads to determine desired position.
+Strategies operate on 2 years of daily bars. **Signal is computed on the close of bar N; the resulting position is intended to be executed at the close of bar N+1** (no look-ahead). `pos_series.iloc[-1]` (the latest value) is what the engine reads to determine desired position. 22 strategies total.
 
 ### `ema_cross_9_21` — "EMA cross (9/21)"
 ```python
@@ -212,26 +275,49 @@ if signal_type == "smart_buy":          strategy = "rsi_revert"   (with buyBelow
 elif rsi is not None and rsi < 35:      strategy = "rsi_revert"   (oversold technical)
 else:                                    strategy = "ema_cross_9_21"
 ```
+Both auto-selected strategies are pure technical indicators with no cross-asset reference, so this rule needs no crypto-specific branch — auto-selected crypto candidates are strategy-safe automatically.
+
+### Crypto strategy exclusions (`CRYPTO_INCOMPATIBLE_STRATEGIES`)
+5 of the 22 registered strategies internally fetch an equity-specific instrument and are economically meaningless for a crypto symbol — excluded from the auto-deploy "backtest every strategy, pick the best Sharpe" loop whenever the target portfolio is crypto:
+
+| Strategy | Cross-references |
+|---|---|
+| `dual_momentum` | SPY (relative momentum) |
+| `dual_momentum_bond` | SPY, TLT |
+| `sma_bond_rotate` | TLT (rotate into bonds when flat) |
+| `rsi_revert_vix` | `^VIX` (regime filter) |
+| `bollinger_vix` | `^VIX` (regime filter) |
+
+These strategies fail *safely* if manually applied to a crypto instance anyway (the VIX-filtered ones fall back to their unfiltered base if the merge/fetch comes up empty) — the exclusion is about not offering a nonsensical "best strategy" pick, not about preventing a crash.
 
 ---
 
-## 7. Position Sizing (`auto_selector.py`)
+## 7. Position Sizing (`auto_selector.py` + `engine.py`)
 
 ```
 risk_pct       = 0.005 if smart_buy else 0.01     # 0.5% vs 1% of equity risked per trade
-dollar_risk    = equity × risk_pct
+dollar_risk    = equity × risk_pct                 # equity = THIS candidate's target portfolio's own equity
 shares         = dollar_risk / (2 × ATR14)
 allocation_usd = min(shares × price, equity × 0.10)   # hard cap: 10% of equity per position
 ```
-Skipped if `allocation_usd < price` (can't afford 1 share).
+Skipped if `allocation_usd < price` (can't afford 1 share/coin at the sizing stage — the actual fill-time rounding is asset-aware, see below).
 
-### Portfolio balance across buckets
-Smart Buy is capped at **50%** of total deployed capital (`SMART_BUY_MAX_SHARE`). Sized candidates from both buckets (each already sorted best-score-first within its bucket) are interleaved: at each step, whichever bucket is proportionally furthest below its target share (`current_allocation / max_share`) gets the next pick. If one bucket runs out of eligible candidates, the other keeps filling with remaining cash.
+### No cross-portfolio balancing
+Each portfolio only ever spends its own cash, sized against its own equity, up to its own 10%-per-position cap. There's no analogue of an old "cap Smart Buy at 50% of deployed capital, interleave picks by proportional share" mechanism — that only existed when all strategies shared one pooled account, and was deleted once each got real independent capital. Candidates are simply taken best-score-first per portfolio, gated only by that portfolio's own cash-floor check below.
 
-### Pre-trade guardrails
-- Skip the entire cycle if `cash / equity < 0.10` (10% cash floor).
-- Cap a single batch at 50 candidates (first-run runaway protection).
-- Never re-enter a symbol with an existing open plan or enabled instance.
+### Pre-trade guardrails (per portfolio)
+- Skip the entire cycle **for that portfolio** if `cash / equity < 0.10` (10% cash floor) — a low-cash Smart Buy doesn't block Crypto or Technical/Sustained from trading.
+- Cap a single batch at 50 candidates per portfolio (first-run runaway protection).
+- Never re-enter a symbol with an existing open plan or enabled instance **in that same portfolio**.
+
+### Fill-time qty rounding (`engine.py`) — the asset-class split
+```python
+def _round_qty(raw_qty, portfolio_id):
+    if portfolio_id == BUCKET_CRYPTO:
+        return round(raw_qty, 6)      # fractional — a $500 allocation into $60k+ BTC needs this
+    return math.floor(raw_qty)        # whole shares for equities, unchanged
+```
+Equities size in whole shares (unchanged from before Crypto existed). Crypto sizes to 6 decimal places — the same precision `store.py` already uses when deriving position quantities from fills — since a single coin can be worth tens of thousands of dollars and most allocations buy a small fraction of one. The minimum viable size is `1` share for equities, `1e-6` for crypto; anything below that is rejected (new entries) or vetoed (analyst-resized orders), same logic, portfolio-aware threshold.
 
 ---
 
@@ -241,7 +327,7 @@ Every proposed order (new entries **and** signal-driven exits) is reviewed by a 
 
 - **Mechanism**: shells out to the local `claude` CLI (`subprocess.run(["claude", "-p", prompt, "--output-format", "json", "--model", <model>, "--tools", "", "--no-session-persistence", "--safe-mode", "--json-schema", <schema>])`), timeout 120s. `--tools ""` forces a single pure-text turn (no tool use); `--safe-mode` skips project memory/hooks discovery.
 - **Framing**: system rules frame it as "a risk-review analyst for a PAPER trading simulator," instructed to **approve unless context clearly argues against the trade** (bias toward letting the mechanical signal through), with side-specific extra instructions for BUY / SHORT / SELL / COVER.
-- **Context supplied to the model** (JSON blob): the proposed order, the strategy's signal context (trend/RSI/MACD/levels from `compute_signals`), the instance's allocation and params, mechanical stop/target defaults, a macro snapshot (risk composite, yield curve, dispersion), dealer gamma positioning (spot, net GEX, flip point, max pain, key levels), and the current portfolio (cash + positions).
+- **Context supplied to the model** (JSON blob): the proposed order, the strategy's signal context (trend/RSI/MACD/levels from `compute_signals`), the instance's allocation and params, mechanical stop/target defaults, a macro snapshot (risk composite, yield curve, dispersion), dealer gamma positioning (spot, net GEX, flip point, max pain, key levels), and **the proposing instance's own portfolio's cash + positions** (not the combined account) — so the review reflects that portfolio's actual book, not cross-portfolio exposure that isn't real for it.
 - **Verdict schema**: `"approve"` or `"veto"`, plus `sizeFactor` (0.0–1.0, forced to 0.0 on veto). For new entries (BUY/SHORT) the model must also return `stop_loss`, `take_profit`, `max_hold_days` (1–365), `thesis`, `exit_plan`.
 - **Mechanical defaults** the model is told to work from: `stop = entry − 2×ATR`, `target = entry + 3×ATR` for longs (inverted for shorts). The model's stop/target are **clamped** server-side: stop must be 0.5×–4×ATR from entry on the correct side; target must be beyond current price on the correct side; `max_hold_days` must be 1–365 — any out-of-range value falls back to the mechanical default.
 - **SELL/COVER** (exits) never veto for market-risk reasons (only for genuine data-quality problems) and ignore `sizeFactor` — exits always close the full held quantity.
@@ -251,13 +337,13 @@ Every proposed order (new entries **and** signal-driven exits) is reviewed by a 
 
 ## 9. Entry / Exit Execution (`engine.py`)
 
-Each engine run (`run_engine(kind)`) does, in order:
+Each engine run (`run_engine(kind, portfolio_ids=None)`) does, in order:
 
-### Step 1 — Mechanical exit sweep (§10) runs first, unconditionally, before any new signals are evaluated.
+### Step 1 — Mechanical exit sweep (§10) runs first, unconditionally, before any new signals are evaluated — scoped to the same `portfolio_ids` if given.
 
-### Step 2 — For each enabled instance:
+### Step 2 — For each enabled instance in scope (all, or filtered to `portfolio_ids`):
 1. Recompute the strategy's desired position (`1`/`0`/`−1`) from the latest 2y daily bars.
-2. Compare to currently held qty (from the broker, signed: +long/−short/0 flat).
+2. Compare to currently held qty **within that instance's own portfolio** (from that portfolio's broker, signed: +long/−short/0 flat).
 3. Determine action:
 
 | Held | Desired | Action |
@@ -270,18 +356,20 @@ Each engine run (`run_engine(kind)`) does, in order:
 
 *(Reversals are two-step: long→short sells first, then shorts on the following run once flat; same for short→long.)*
 
-4. **Sizing**: for opens, `qty = floor(allocation_usd / price)` (skip if < 1 share); for closes, `qty = abs(held)` (always closes the full position).
-5. Create an order record, compute mechanical stop/target defaults (§8), send to the analyst for review.
+4. **Sizing**: for opens, `qty = _round_qty(allocation_usd / price, portfolio_id)` — whole-floored for equities, 6-decimal-rounded for crypto (§7); skip if below that portfolio's minimum viable qty. For closes, `qty = abs(held)` (always closes the full position).
+5. Create an order record (stamped with the instance's `portfolio_id`), compute mechanical stop/target defaults (§8), send to the analyst for review.
 6. If **vetoed** or sized to zero by the analyst → order marked `vetoed`, nothing executes.
-7. Otherwise → submit market order to the broker (§11). Approved size for opens is `floor(qty × analyst_sizeFactor)`; closes always use the full `abs(held)` regardless of `sizeFactor`.
-8. **On a new open fill**: create a trade plan — entry price/qty from the fill, stop/target/max-hold-days from the analyst (if it provided a full thesis) or the mechanical defaults, `levels_source` tagged `"analyst"` or `"mechanical"` accordingly, plus the written thesis/exit-plan text.
-9. **On a close fill** (`side in {sell, cover}`): every open trade plan for that symbol is closed with `exit_reason = "signal_exit"`.
+7. Otherwise → submit market order to **that portfolio's own broker** (§11). Approved size for opens is `_round_qty(qty × analyst_sizeFactor, portfolio_id)`; closes always use the full `abs(held)` regardless of `sizeFactor`.
+8. **On a new open fill**: create a trade plan (stamped with `portfolio_id`) — entry price/qty from the fill, stop/target/max-hold-days from the analyst (if it provided a full thesis) or the mechanical defaults, `levels_source` tagged `"analyst"` or `"mechanical"` accordingly, plus the written thesis/exit-plan text.
+9. **On a close fill** (`side in {sell, cover}`): every open trade plan for that symbol **within that same portfolio** is closed with `exit_reason = "signal_exit"` — a same-symbol plan in a *different* portfolio is never touched, since portfolios can independently hold the same symbol.
+
+### Step 3 — Mark every in-scope portfolio to market (unconditional per run, cheap — a handful of portfolios), recording an `equity_snapshots` row for each.
 
 ---
 
-## 10. Mechanical Exits (`exits.py`) — checked every 15 min during market hours, and once at the start of every engine run, no analyst review
+## 10. Mechanical Exits (`exits.py`)
 
-For each open plan, fetch the latest quote and check, **in priority order**:
+Checked on the schedule in §2 (equity: every 15 min during market hours; crypto: every 30 min, 24/7) and once at the start of every engine run in that same scope, no analyst review. For each open plan **in scope**, fetch the latest quote and check, **in priority order**:
 
 ```
 Long:
@@ -292,41 +380,40 @@ Short (inverted):
   price <= take_profit → "take_profit"
 
 Then (either direction):
-  trading_days_held >= max_hold_days → "time_stop"
+  days_held >= max_hold_days → "time_stop"
 ```
-`trading_days_held` = business-day count (`numpy.busday_count`) from `opened_at` to today.
+`days_held` = business-day count (`numpy.busday_count`) from `opened_at` to today for equity portfolios; **calendar-day count** for crypto plans specifically — a business-day count would undercount real elapsed exposure across a weekend for an asset that never stops trading.
 
-If triggered, the position is closed immediately at the current quote — no analyst gate, "risk-reducing sells are never gated on anything." Quotes are ~15-min delayed, so fills can gap through the stated level rather than filling exactly at it.
+If triggered, the position is closed immediately at the current quote through **that plan's own portfolio's broker** — no analyst gate, "risk-reducing sells are never gated on anything." Quotes are ~15-min delayed, so fills can gap through the stated level rather than filling exactly at it.
 
 ---
 
-## 11. Broker / Fill Model (`broker.py` — `PaperBroker`)
+## 11. Broker / Fill Model (`broker.py`)
 
+```mermaid
+flowchart LR
+    E[engine.py / exits.py] -->|get_active_broker(portfolio_id)| REG{"_paper_brokers registry\n{portfolio_id: PaperBroker}"}
+    REG -->|lazy-create if missing| SB2[PaperBroker\nsmart_buy]
+    REG -->|lazy-create if missing| TS2[PaperBroker\ntechnical_sustained]
+    REG -->|lazy-create if missing| CR2[PaperBroker\ncrypto]
+```
+
+- One `PaperBroker(portfolio_id)` instance per portfolio, held in a module-level registry (`get_paper_broker(portfolio_id)`, lazy-created and cached; `get_active_broker(portfolio_id)` is the entry point everything calls, transparently swapping to a real broker if one's ever configured — Alpaca, if used, stays a single non-portfolio-scoped broker since a real brokerage account doesn't naturally split into virtual sub-ledgers).
 - **Fills instantly** at the latest available quote (`client.get_quote(symbol)["last"]`) — no partial fills, no order book, no slippage or commission model.
-- `buy`: rejected if `cost > cash`. `sell`: rejected if `qty > held long qty`. `short`: no cash-headroom check (receives short-sale proceeds as cash). `cover`: rejected if `qty > held short qty`.
-- Every fill records to a `fills` table (used to derive net positions) and triggers `mark_to_market()`, which re-prices every open position at its latest quote, computes total equity, and snapshots `{ts, equity, cash}`.
+- `buy`: rejected if `cost > that portfolio's own cash`. `sell`: rejected if `qty > that portfolio's own held long qty`. `short`: no cash-headroom check (receives short-sale proceeds as cash). `cover`: rejected if `qty > that portfolio's own held short qty`.
+- Every fill records to the `fills` table (with `portfolio_id`, used to derive that portfolio's net positions) and triggers `mark_to_market()`, which re-prices every position **that portfolio holds** at its latest quote, computes that portfolio's total equity, and snapshots `{portfolio_id, ts, equity, cash}`.
 
 ---
 
 ## 12. Data Model Summary (SQLite, `store.py`)
 
-- **`account`**: singleton row — `cash`, `starting_cash`.
-- **`instances`**: one row per active strategy deployment — `symbol`, `strategy`, `params` (JSON), `allocation_usd`, `enabled`, `source_tags` (JSON list — `smart_buy`/`technical`/`sustained`/`congress`/`smart_universe`).
-- **`fills`**: raw execution log — `symbol`, `side`, `qty`, `price`, `ts`.
-- **`trade_plans`**: one row per position lifecycle — `symbol`, `qty`, `entry_price`, `opened_at`, `stop_loss`, `take_profit`, `max_hold_days`, `levels_source` (`analyst`/`mechanical`), `thesis`, `exit_plan`, `status` (`open`/`closed`), `exit_price`, `exit_reason` (`stop_loss`/`take_profit`/`time_stop`/`signal_exit`), `closed_at`, `realized_pnl`, `realized_pnl_pct`, `direction` (`long`/`short`), analyst `verdict`/`size_factor`/`rationale`/`model`, `source_tags`, `selection_thesis`, `selection_snapshot` (JSON — the raw signal values behind the pick).
-- **`equity_snapshots`**: `ts, equity, cash` — one row per `mark_to_market()` call.
-- **`runs`**: one row per engine invocation — `kind` (`open`/`close`/`manual`), timing, proposed/filled/vetoed counts, errors.
-- **`auto_select_runs`**: journal of every 10:05/16:05 auto-selector invocation, including skipped/empty cycles.
-
-### Bucket classification
-```python
-BUCKET_SMART_BUY           = "smart_buy"
-BUCKET_TECHNICAL_SUSTAINED = "technical_sustained"
-
-def bucket_of_tags(tags):
-    return BUCKET_SMART_BUY if tags and "smart_buy" in tags else BUCKET_TECHNICAL_SUSTAINED
-```
-Every instance/plan sorts into exactly one of these two buckets for reporting and portfolio-balance purposes, based solely on whether `"smart_buy"` is present in its `source_tags`.
+- **`portfolios`**: `id` (`smart_buy` / `technical_sustained` / `crypto`), `label`, `cash`, `starting_cash`, `starting_equity`, `created_at`, `enabled`. One row per strategy; see §1.
+- **`instances`**: one row per active strategy deployment — `symbol`, `strategy`, `params` (JSON), `allocation_usd`, `enabled`, `portfolio_id`, `source_tags` (JSON list — `smart_buy`/`technical`/`sustained`/`congress`/`smart_universe`).
+- **`orders`**, **`fills`**, **`trade_plans`**: all carry a denormalized `portfolio_id` column so a portfolio's full history survives even if the originating instance is later deleted. `trade_plans` additionally: `qty`, `entry_price`, `opened_at`, `stop_loss`, `take_profit`, `max_hold_days`, `levels_source` (`analyst`/`mechanical`), `thesis`, `exit_plan`, `status` (`open`/`closed`), `exit_price`, `exit_reason` (`stop_loss`/`take_profit`/`time_stop`/`signal_exit`), `closed_at`, `realized_pnl`, `realized_pnl_pct`, `direction` (`long`/`short`), analyst `verdict`/`size_factor`/`rationale`/`model`, `selection_thesis`, `selection_snapshot` (JSON — the raw signal values behind the pick).
+- **`equity_snapshots`**: composite key `(portfolio_id, ts)` — `equity, cash` — one row per portfolio per `mark_to_market()` call. **`equity_snapshots_legacy`**: the original single-account curve, preserved read-only from before the portfolio split (used to backfill the "All sources" combined equity chart's pre-split history — see §1's frontend consumer).
+- **`runs`**: one row per engine invocation — `kind` (`open`/`close`/`manual`/`crypto`), timing, proposed/filled/vetoed counts, errors.
+- **`auto_select_runs`**: journal of every auto-selector invocation across every portfolio, including skipped/empty cycles, plus `bucket_totals` (dollar allocation currently committed, keyed by every live portfolio id — not hardcoded to two).
+- **`scan_watchlist`** / **`scan_history`**: symbol-agnostic — the same tables serve equity and crypto technical scoring, distinguished only by which portfolio a scored symbol later gets routed to (§3).
 
 ---
 
@@ -334,30 +421,34 @@ Every instance/plan sorts into exactly one of these two buckets for reporting an
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `STARTING_CASH` | $20,000.00 | Initial account equity |
+| `DEFAULT_PORTFOLIO_STARTING_CASH` | $10,000.00 | Default starting balance for a newly created portfolio with no history to inherit |
 | `RISK_PCT_NORMAL` | 1% | Equity risked per Technical/Sustained trade |
 | `RISK_PCT_SMART_BUY` | 0.5% | Equity risked per Smart Buy trade |
-| `MAX_POSITION_PCT` | 10% | Max equity in any single position |
-| `MIN_CASH_PCT` | 10% | Skip new entries if cash falls below this share of equity |
+| `MAX_POSITION_PCT` | 10% | Max equity in any single position (per portfolio) |
+| `MIN_CASH_PCT` | 10% | Skip new entries for a portfolio if its own cash falls below this share of its own equity |
 | `TECH_MIN_SCORE` | 3 | Min technical score for Technical sourcing |
 | `SUSTAINED_MIN_SCORE` | 2 | Score threshold counted toward a Sustained streak |
 | `SUSTAINED_MIN_STREAK` | 3 | Consecutive qualifying scans required |
 | `SMART_BUY_MAX_DAYS` | 30 | Max age of a smart-buy alert to still be actionable |
 | `CONGRESS_MIN_ANN_RETURN` | 60% | Min politician annualized return to tag a non-Smart-Buy pick "congress" |
 | `CONGRESS_TAG_MIN_QUALITY` | {sharp, mixed} | Quality tiers eligible for the "congress" tag |
-| `SMART_BUY_MAX_SHARE` | 50% | Cap on Smart Buy's share of deployed capital |
 | `SMART_BUY_RSI_ENTRY` | 45 | `rsi_revert` buyBelow override for Smart Buy instances (default 30) |
 | Sharp investor threshold | ≥65% avg win rate | Gate for "sharp" politician quality |
 | Mixed investor threshold | 45–65% avg win rate | "mixed" quality |
-| STOP_ATR_MULT | 2.0× | Mechanical stop distance from entry |
-| TARGET_ATR_MULT | 3.0× | Mechanical target distance from entry |
+| `STOP_ATR_MULT` | 2.0× | Mechanical stop distance from entry |
+| `TARGET_ATR_MULT` | 3.0× | Mechanical target distance from entry |
 | `ema_cross_9_21` params | fast=9, slow=21 | EMA periods |
 | `ema_cross_9_21` maxHoldDays | 30 trading days | Default time-stop |
 | `rsi_revert` params | length=14, buyBelow=30, exitAbove=50 | RSI thresholds (buyBelow→45 for Smart Buy) |
 | `rsi_revert` maxHoldDays | 20 trading days | Default time-stop |
+| `CRYPTO_SYMBOLS` | 27 tickers | Validated crypto universe — routes Technical/Sustained candidates to the Crypto portfolio instead |
+| `CRYPTO_INCOMPATIBLE_STRATEGIES` | 5 strategy ids | Excluded from crypto auto-deploy backtesting (SPY/VIX/TLT cross-references) |
+| Crypto qty precision | 6 decimals, min 1e-6 | Fractional sizing for crypto vs. whole-share flooring for equities |
 | Analyst CLI timeout | 120s | Falls back to auto-approve on timeout |
-| Exit sweep cadence | every 15 min, 9:00–15:45 ET | Effective active window 9:30–15:45 (market-hours gated) |
-| Auto-select cadence | 10:05 & 16:05 ET | Runs 5 min after the paper-engine open/close runs |
+| Equity exit sweep cadence | every 15 min, 9:00–15:45 ET, Mon-Fri | Effective active window 9:30–15:45 (market-hours gated) |
+| Equity auto-select cadence | 10:05 & 16:05 ET, Mon-Fri | Runs 5 min after the paper-engine open/close runs |
+| Crypto engine/auto-select cadence | every 4h, every day | No market-hours gate |
+| Crypto exit sweep cadence | every 30 min, every day | No market-hours gate |
 
 ---
 
@@ -365,15 +456,27 @@ Every instance/plan sorts into exactly one of these two buckets for reporting an
 
 To rebuild this system from scratch, implement in this order:
 
-1. **Data layer**: OHLCV history fetch + quote fetch for any symbol, with a caching layer.
+1. **Data layer**: OHLCV history fetch + quote fetch for any symbol (equity or crypto ticker format — same client), with a caching layer.
 2. **Indicators**: RSI(Wilder), ATR(Wilder), MACD, SMA50/200, EMA9/21, Bollinger(20,2) → `compute_signals()`.
 3. **Technical scanner**: run `compute_signals` per watchlist symbol on a schedule, score per §4, persist to a scan-history table.
 4. **Strategy functions**: `ema_cross_9_21` and `rsi_revert` per §6, returning a position series from a bars DataFrame.
 5. **Politician/congress data pipeline**: per-politician win rate → per-ticker quality tier (§3c) → smart-buy alert table.
-6. **Auto-selector**: candidate gathering (§3) → scoring/ranking → ATR-based position sizing (§7) → bucket-balanced interleaving → instance creation.
-7. **Broker**: instant-fill paper broker with cash/position bookkeeping (§11).
-8. **Analyst gate**: LLM review call with the approve/veto/size/level-clamp contract (§8), with a safe auto-approve fallback on any failure.
-9. **Engine**: desired-vs-held diffing, order creation, analyst review, execution, trade-plan lifecycle (§9).
-10. **Mechanical exit sweep**: stop/target/time-stop checker, no analyst gate, running independently of the engine on a tighter interval (§10).
-11. **Scheduler**: wire all of the above to the timetable in §2.
-12. **Reporting**: per-bucket trade stats, Sharpe/drawdown/CAGR from compounded closed-trade returns, S&P 500 benchmark comparison over the matching window.
+6. **Portfolio model**: a `portfolios` table (§1) — id/label/cash/starting_cash/starting_equity — and a `portfolio_id` column denormalized onto every instance/order/fill/trade-plan/equity-snapshot table, keyed to composite `(portfolio_id, ts)` for equity snapshots.
+7. **Broker registry**: `PaperBroker(portfolio_id)` per portfolio, cash/position bookkeeping scoped to that portfolio's own fills only (§11).
+8. **Auto-selector**: candidate gathering (§3), tagging each with a target `portfolioId` at gather time (technical/sustained default, smart-buy override, crypto-universe override) → scoring/ranking → per-portfolio ATR-based position sizing (§7) → instance creation.
+9. **Analyst gate**: LLM review call with the approve/veto/size/level-clamp contract (§8), scoped to the proposing instance's own portfolio, with a safe auto-approve fallback on any failure.
+10. **Engine**: desired-vs-held diffing within each instance's own portfolio, asset-aware qty rounding (whole shares vs. fractional crypto), order creation, analyst review, execution, trade-plan lifecycle (§9).
+11. **Mechanical exit sweep**: stop/target/time-stop checker, no analyst gate, portfolio-scoped, running independently of the engine on a tighter interval (§10).
+12. **Scheduler**: wire equity portfolios to the Mon-Fri market-hours timetable (§2); wire any 24/7 asset class (crypto) to its own unscoped-time cadence, using an optional `portfolio_ids` filter on steps 8–11 so the two cadences never redundantly re-touch each other.
+13. **Reporting**: per-portfolio trade stats, Sharpe/drawdown/CAGR from either the portfolio's real equity curve (once it has enough history) or compounded closed-trade returns as a fallback, S&P 500 benchmark comparison over the matching window, plus a combined view summing every portfolio.
+
+---
+
+## Appendix: performance figures
+
+The **"Performance so far"** figures that used to live in this document (single pooled $20,000 account, ~19 days) predate the portfolio split and are no longer representative — Smart Buy and Technical/Sustained now report separately from their own real equity curves, and Crypto has its own $10,000 track record starting from its creation date. Current numbers for any portfolio are always available live:
+
+- `GET /api/paper/account` — real-time equity/cash/positions per portfolio, plus a combined view.
+- `GET /api/paper/stats` — win rate, Sharpe, drawdown, annualized return, and S&P 500 benchmark, broken out per portfolio (`all` / `smartBuy` / `technicalSustained` / `crypto`).
+- `GET /api/paper/equity` — per-portfolio equity curves, plus the preserved pre-split pooled curve (`legacy`).
+- The Paper Trading and Trade Journal pages in the app render all of the above with a tab per portfolio.
