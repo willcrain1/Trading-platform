@@ -94,7 +94,8 @@ def check_exits(record_run: bool = True) -> dict:
         reason, note = hit
 
         direction = plan.get("direction", "long")
-        positions = store.get_positions()
+        portfolio_id = plan.get("portfolio_id") or store.BUCKET_TECHNICAL_SUSTAINED
+        positions = store.get_positions(portfolio_id)
         held_long = next((p["qty"] for p in positions if p["symbol"] == symbol and p["qty"] > 0), 0.0)
         held_short = abs(next((p["qty"] for p in positions if p["symbol"] == symbol and p["qty"] < 0), 0.0))
         held = held_short if direction == "short" else held_long
@@ -109,7 +110,11 @@ def check_exits(record_run: bool = True) -> dict:
         exit_side = "cover" if direction == "short" else "sell"
         order_id = store.create_order(plan["instance_id"], symbol, exit_side, qty, "stops", note=note)
         try:
-            fill = get_active_broker().submit_market_order(order_id, symbol, "sell", qty)
+            # Bug fix: this previously hardcoded "sell" regardless of exit_side, which
+            # meant a short position's cover exit (stop/target/time-stop) would hit the
+            # broker's "sell" branch, find 0 long shares held, and raise OrderRejected —
+            # short positions likely couldn't mechanically exit at all before this fix.
+            fill = get_active_broker(portfolio_id).submit_market_order(order_id, symbol, exit_side, qty)
         except OrderRejected as e:
             store.set_order_status(order_id, "error", note=f"{note} — REJECTED: {e}")
             errors.append(f"{symbol}: exit rejected: {e}")

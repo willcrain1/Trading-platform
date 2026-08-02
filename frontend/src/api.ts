@@ -158,14 +158,36 @@ export interface PaperPosition {
   unrealizedPnl: number
 }
 
-export interface PaperAccount {
+export interface PaperPortfolio {
   equity: number
   cash: number
-  positions: PaperPosition[]
+  positions: (PaperPosition & { portfolioId?: string })[]
+  label?: string
   startingCash: number
+  startingEquity: number
   totalPnl: number
-  totalPnlPct: number
+  totalPnlPct: number | null
+}
+
+export interface PaperAccount {
+  portfolios: Record<string, PaperPortfolio>
+  combined: PaperPortfolio
   schedulerJobs: { id: string; nextRun: string | null }[]
+}
+
+export interface PaperOverlapEntry {
+  symbol: string
+  portfolios: {
+    portfolioId: string
+    planId: number
+    entryPrice: number
+    openedAt: number
+    direction: 'long' | 'short'
+    qty: number
+    stopLoss: number
+    takeProfit: number
+    thesis: string | null
+  }[]
 }
 
 export interface SelectionSnapshot {
@@ -327,6 +349,7 @@ export interface BatchCell {
 export interface AutoDeployResult {
   instanceId: number
   symbol: string
+  portfolioId?: string
   strategy: string
   strategyLabel: string
   sharpe: number | null
@@ -682,7 +705,11 @@ export const api = {
     period?: string
   }) => send<BacktestResult>('/api/backtest', 'POST', body),
   paperAccount: () => get<PaperAccount>('/api/paper/account'),
-  paperEquity: () => get<{ curve: { ts: number; equity: number; cash: number }[] }>('/api/paper/equity'),
+  paperEquity: () => get<{
+    portfolios: Record<string, { curve: { ts: number; equity: number; cash: number }[] }>
+    legacy: { curve: { ts: number; equity: number; cash: number }[] }
+  }>('/api/paper/equity'),
+  paperOverlap: () => get<{ overlaps: PaperOverlapEntry[]; count: number }>('/api/paper/overlap'),
   paperOrders: () => get<{ orders: PaperOrder[] }>('/api/paper/orders'),
   paperRuns: () => get<{ runs: PaperRun[] }>('/api/paper/runs'),
   paperInstances: () => get<{ instances: PaperInstance[] }>('/api/paper/instances'),
@@ -691,6 +718,7 @@ export const api = {
     strategy: string
     params?: Record<string, number>
     allocationUsd: number
+    portfolioId: string
   }) => send<{ id: number }>('/api/paper/instances', 'POST', body),
   paperUpdateInstance: (id: number, body: { enabled?: boolean; allocationUsd?: number }) =>
     send<{ ok: boolean }>(`/api/paper/instances/${id}`, 'PATCH', body),
@@ -761,8 +789,8 @@ export const api = {
       '/api/congress/import', 'POST', { csv_text: csvText }
     ),
   congressClearImport: () => send<{ ok: boolean }>('/api/congress/import', 'DELETE'),
-  autoDeploy: (symbol: string, allocationUsd: number, period = '2y') =>
-    send<AutoDeployResult>('/api/paper/auto-deploy', 'POST', { symbol, allocationUsd, period }),
+  autoDeploy: (symbol: string, allocationUsd: number, portfolioId: string, period = '2y') =>
+    send<AutoDeployResult>('/api/paper/auto-deploy', 'POST', { symbol, allocationUsd, portfolioId, period }),
   healthCheck: () =>
     send<{ results: HealthCheckRow[]; flagged: number; checked: number }>('/api/paper/health-check', 'POST', {}),
   brokerConfig: () => get<BrokerConfig>('/api/broker/config'),
@@ -789,8 +817,10 @@ export const api = {
     get<AutoSelectStatus>('/api/scan/auto-select/status'),
   autoSelectRunNow: () =>
     send<AutoSelectResult>('/api/scan/auto-select/run-now', 'POST', {}),
-  paperReset: () =>
-    send<{ ok: boolean; cash: number }>('/api/paper/reset', 'POST', {}),
+  paperReset: (portfolio: string) =>
+    send<{ ok: boolean; portfolio: string }>(`/api/paper/reset?portfolio=${portfolio}`, 'POST', {}),
+  paperResetAll: () =>
+    send<{ ok: boolean; resetAll: boolean }>('/api/paper/reset?confirm=all', 'POST', {}),
   dataConfig: () =>
     get<{
       polygonKeySet: boolean

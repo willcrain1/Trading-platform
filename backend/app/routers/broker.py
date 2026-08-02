@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..trading import broker_config
-from ..trading.broker import get_active_broker, paper_broker
+from ..trading.broker import using_paper_broker
 
 router = APIRouter(prefix="/api/broker", tags=["broker"])
 
@@ -22,8 +22,7 @@ class BrokerConfigRequest(BaseModel):
 @router.get("/config")
 def get_config():
     cfg = broker_config.load()
-    active = get_active_broker()
-    is_paper_sim = active is paper_broker
+    is_paper_sim = using_paper_broker()
     # strip secrets from response
     safe = {"broker": cfg.get("broker", "paper")}
     if cfg.get("alpaca"):

@@ -117,5 +117,7 @@ class AlpacaBroker:
                 "value": round(value, 2),
                 "unrealizedPnl": round(value - p["qty"] * p["avgCost"], 2),
             })
-        store.snapshot_equity(round(equity, 2), round(cash, 2))
+        # Alpaca is a single real brokerage account, not split into per-strategy
+        # portfolios — snapshot it under a fixed sentinel id.
+        store.snapshot_equity("alpaca_live", round(equity, 2), round(cash, 2))
         return {"equity": round(equity, 2), "cash": round(cash, 2), "positions": marked}

@@ -8,6 +8,7 @@ backend/data/broker_config.json
 
 # ── Runtime data (regenerated locally, not source) ──────────────────────────
 backend/data/*.db
+backend/data/*.db.bak*
 backend/debug_claude.log
 *.log
 

@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS account (
   starting_cash REAL NOT NULL,
   created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS portfolios (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  cash REAL NOT NULL,
+  starting_cash REAL NOT NULL,
+  starting_equity REAL,
+  created_at REAL NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS instances (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   symbol TEXT NOT NULL,
@@ -48,7 +57,8 @@ CREATE TABLE IF NOT EXISTS instances (
   created_at REAL NOT NULL,
   source_tags TEXT,
   selection_thesis TEXT,
-  selection_snapshot TEXT
+  selection_snapshot TEXT,
+  portfolio_id TEXT
 );
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +71,8 @@ CREATE TABLE IF NOT EXISTS orders (
   note TEXT,
   proposed_at REAL NOT NULL,
   filled_at REAL,
-  fill_price REAL
+  fill_price REAL,
+  portfolio_id TEXT
 );
 CREATE TABLE IF NOT EXISTS decisions (
   order_id INTEGER PRIMARY KEY,
@@ -78,12 +89,15 @@ CREATE TABLE IF NOT EXISTS fills (
   side TEXT NOT NULL,
   qty REAL NOT NULL,
   price REAL NOT NULL,
-  ts REAL NOT NULL
+  ts REAL NOT NULL,
+  portfolio_id TEXT
 );
 CREATE TABLE IF NOT EXISTS equity_snapshots (
-  ts REAL PRIMARY KEY,
+  portfolio_id TEXT NOT NULL,
+  ts REAL NOT NULL,
   equity REAL NOT NULL,
-  cash REAL NOT NULL
+  cash REAL NOT NULL,
+  PRIMARY KEY (portfolio_id, ts)
 );
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +130,8 @@ CREATE TABLE IF NOT EXISTS trade_plans (
   exit_reason TEXT CHECK (exit_reason IN ('stop_loss','take_profit','time_stop','signal_exit','manual')),
   closed_at REAL,
   realized_pnl REAL,
-  realized_pnl_pct REAL
+  realized_pnl_pct REAL,
+  portfolio_id TEXT
 );
 CREATE TABLE IF NOT EXISTS auto_select_runs (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +196,85 @@ def _migrate(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass  # already exists
 
+    # ── per-strategy portfolios migration ───────────────────────────────────
+    # Split the single shared account into one real portfolio per strategy
+    # bucket. No FK enforcement exists anywhere in this DB (no PRAGMA
+    # foreign_keys), so plain nullable ADD COLUMN is sufficient — no table
+    # rebuilds needed.
+    for table in ("instances", "orders", "fills", "trade_plans"):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN portfolio_id TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # already exists
+
+    try:
+        conn.execute("ALTER TABLE portfolios ADD COLUMN starting_equity REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # already exists
+
+    # equity_snapshots used to be one global row per timestamp (PK on ts alone).
+    # Old pooled history can't be retroactively attributed to one portfolio, so
+    # preserve it read-only under a new name and start a fresh portfolio-scoped
+    # table (composite PK) for go-forward history.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(equity_snapshots)").fetchall()]
+    if cols and "portfolio_id" not in cols:
+        conn.execute("ALTER TABLE equity_snapshots RENAME TO equity_snapshots_legacy")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+              portfolio_id TEXT NOT NULL,
+              ts REAL NOT NULL,
+              equity REAL NOT NULL,
+              cash REAL NOT NULL,
+              PRIMARY KEY (portfolio_id, ts)
+            )
+        """)
+        conn.commit()
+
+    # Backfill portfolio_id on existing instances from their source_tags, then
+    # cascade to orders/trade_plans (via instance_id) and fills (via order_id).
+    # Orphaned rows (deleted/missing instance) default to Technical/Sustained,
+    # matching bucket_of_tags(None)'s existing default.
+    rows = conn.execute("SELECT id, source_tags FROM instances WHERE portfolio_id IS NULL").fetchall()
+    for r in rows:
+        tags = json.loads(r["source_tags"]) if r["source_tags"] else None
+        conn.execute("UPDATE instances SET portfolio_id = ? WHERE id = ?", (bucket_of_tags(tags), r["id"]))
+    conn.execute(f"""
+        UPDATE orders SET portfolio_id = COALESCE(
+            (SELECT portfolio_id FROM instances WHERE instances.id = orders.instance_id),
+            '{BUCKET_TECHNICAL_SUSTAINED}'
+        ) WHERE portfolio_id IS NULL
+    """)
+    conn.execute(f"""
+        UPDATE trade_plans SET portfolio_id = COALESCE(
+            (SELECT portfolio_id FROM instances WHERE instances.id = trade_plans.instance_id),
+            '{BUCKET_TECHNICAL_SUSTAINED}'
+        ) WHERE portfolio_id IS NULL
+    """)
+    conn.execute(f"""
+        UPDATE fills SET portfolio_id = COALESCE(
+            (SELECT portfolio_id FROM orders WHERE orders.id = fills.order_id),
+            '{BUCKET_TECHNICAL_SUSTAINED}'
+        ) WHERE portfolio_id IS NULL
+    """)
+    conn.commit()
+
+    # Seed the two known portfolios if they don't exist yet. Starting cash is
+    # 0 here deliberately — the one-time seeding script (scripts/seed_portfolios.py)
+    # sets the real starting_cash/cash split based on each bucket's actual
+    # realized+unrealized contribution; this is just a safety net so the app
+    # never crashes looking up a portfolio row that doesn't exist yet.
+    for pid, label in ((BUCKET_SMART_BUY, "Smart Buy"), (BUCKET_TECHNICAL_SUSTAINED, "Technical/Sustained")):
+        exists = conn.execute("SELECT 1 FROM portfolios WHERE id = ?", (pid,)).fetchone()
+        if exists is None:
+            conn.execute(
+                "INSERT INTO portfolios (id, label, cash, starting_cash, created_at, enabled)"
+                " VALUES (?, ?, 0, 0, ?, 1)",
+                (pid, label, time.time()),
+            )
+    conn.commit()
+
 
 def get_conn() -> sqlite3.Connection:
     global _conn
@@ -204,9 +298,11 @@ def _rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
-# ---- account / positions ----
+# ---- account (legacy singleton — superseded by portfolios below) ----
 
 def get_account() -> dict:
+    """Legacy pooled-account row. No longer written to; kept only so old data
+    remains readable. Use get_portfolio()/list_portfolios() for anything new."""
     with _lock:
         acc = dict(get_conn().execute("SELECT * FROM account WHERE id = 1").fetchone())
     return acc
@@ -219,31 +315,110 @@ def set_cash(cash: float) -> None:
         conn.commit()
 
 
-def adjust_cash(delta: float, *, min_cash: float | None = None) -> float:
-    """Atomically read-modify-write cash by delta under a single lock acquisition.
+# ---- portfolios (one real capital pool + equity curve per strategy) ----
 
-    Broker code previously did `cash = get_cash()` then `set_cash(cash ± amount)` as two
-    separate lock acquisitions — if two orders filled close enough together, the second
-    write could silently overwrite the first using a stale read (a lost-update race),
-    permanently dropping part of a real cash movement with no error or trace. Reading and
-    writing inside one `with _lock` closes that window. Raises ValueError (leaving cash
+DEFAULT_PORTFOLIO_STARTING_CASH = 10_000.0
+
+
+def create_portfolio(portfolio_id: str, label: str,
+                     starting_cash: float = DEFAULT_PORTFOLIO_STARTING_CASH,
+                     starting_equity: float | None = None) -> None:
+    """starting_cash is the pure cash reserve (what reset_portfolio() restores cash
+    to). starting_equity is the day-1 TOTAL value baseline (cash + any carried-over
+    open positions) used to measure totalPnl/totalPnlPct going forward — defaults to
+    starting_cash for the normal case of a brand-new portfolio with no positions yet.
+    They diverge when a portfolio is seeded with pre-existing open positions (see
+    scripts/seed_portfolios.py), where starting_cash alone would understate the real
+    day-1 baseline and produce a nonsensical P&L%.
+
+    starting_cash defaults to $10,000 — the baseline for a genuinely new strategy
+    with no trading history to inherit. Pass an explicit value when seeding a
+    portfolio out of pre-existing pooled history (e.g. scripts/seed_portfolios.py),
+    where the fair starting balance has to be computed instead of assumed."""
+    if starting_equity is None:
+        starting_equity = starting_cash
+    with _lock:
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO portfolios (id, label, cash, starting_cash, starting_equity, created_at, enabled)"
+            " VALUES (?, ?, ?, ?, ?, ?, 1)"
+            " ON CONFLICT(id) DO UPDATE SET label=excluded.label, cash=excluded.cash,"
+            " starting_cash=excluded.starting_cash, starting_equity=excluded.starting_equity",
+            (portfolio_id, label, starting_cash, starting_cash, starting_equity, time.time()),
+        )
+        conn.commit()
+
+
+def get_portfolio(portfolio_id: str) -> dict:
+    with _lock:
+        row = get_conn().execute("SELECT * FROM portfolios WHERE id = ?", (portfolio_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown portfolio '{portfolio_id}'")
+    return dict(row)
+
+
+def list_portfolios() -> list[dict]:
+    with _lock:
+        return _rows(get_conn().execute("SELECT * FROM portfolios ORDER BY id"))
+
+
+def adjust_cash(delta: float, portfolio_id: str, *, min_cash: float | None = None) -> float:
+    """Atomically read-modify-write one portfolio's cash by delta under a single lock
+    acquisition. Reading and writing inside one `with _lock` (rather than a separate
+    read-then-write) closes a lost-update race where two orders filling close together
+    could silently drop part of a real cash movement. Raises ValueError (leaving cash
     unchanged) if min_cash is given and the result would fall below it.
     """
     with _lock:
         conn = get_conn()
-        cur_cash = conn.execute("SELECT cash FROM account WHERE id = 1").fetchone()[0]
+        row = conn.execute("SELECT cash FROM portfolios WHERE id = ?", (portfolio_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown portfolio '{portfolio_id}'")
+        cur_cash = row[0]
         new_cash = cur_cash + delta
         if min_cash is not None and new_cash < min_cash - 1e-6:
             raise ValueError(f"insufficient cash: have {cur_cash:,.2f}, need {-delta:,.2f}")
-        conn.execute("UPDATE account SET cash = ? WHERE id = 1", (new_cash,))
+        conn.execute("UPDATE portfolios SET cash = ? WHERE id = ?", (new_cash, portfolio_id))
         conn.commit()
         return new_cash
 
 
-def get_positions() -> list[dict]:
-    """Net positions derived from fills. Positive qty = long, negative = short."""
+def reset_portfolio(portfolio_id: str) -> None:
+    """Wipe one portfolio's trading data and restore it to its own starting_cash —
+    every other portfolio is untouched."""
     with _lock:
-        fills = _rows(get_conn().execute("SELECT * FROM fills ORDER BY ts"))
+        conn = get_conn()
+        row = conn.execute("SELECT starting_cash FROM portfolios WHERE id = ?", (portfolio_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown portfolio '{portfolio_id}'")
+        starting_cash = row[0]
+        conn.execute(
+            "DELETE FROM decisions WHERE order_id IN (SELECT id FROM orders WHERE portfolio_id = ?)",
+            (portfolio_id,),
+        )
+        conn.execute("DELETE FROM fills WHERE portfolio_id = ?", (portfolio_id,))
+        conn.execute("DELETE FROM orders WHERE portfolio_id = ?", (portfolio_id,))
+        conn.execute("DELETE FROM trade_plans WHERE portfolio_id = ?", (portfolio_id,))
+        conn.execute("DELETE FROM instances WHERE portfolio_id = ?", (portfolio_id,))
+        conn.execute("DELETE FROM equity_snapshots WHERE portfolio_id = ?", (portfolio_id,))
+        conn.execute("UPDATE portfolios SET cash = ? WHERE id = ?", (starting_cash, portfolio_id))
+        conn.commit()
+
+
+# ---- positions ----
+
+def get_positions(portfolio_id: str | None = None) -> list[dict]:
+    """Net positions derived from fills. Positive qty = long, negative = short.
+    portfolio_id=None blends fills across every portfolio into one net-exposure view
+    (used for the combined/all-sources display); pass an explicit id to scope to one
+    portfolio's own book (used by that portfolio's broker)."""
+    with _lock:
+        if portfolio_id is None:
+            fills = _rows(get_conn().execute("SELECT * FROM fills ORDER BY ts"))
+        else:
+            fills = _rows(get_conn().execute(
+                "SELECT * FROM fills WHERE portfolio_id = ? ORDER BY ts", (portfolio_id,)
+            ))
     pos: dict[str, dict] = {}
     for f in fills:
         p = pos.setdefault(f["symbol"], {"symbol": f["symbol"], "qty": 0.0, "cost": 0.0})
@@ -287,16 +462,23 @@ def list_instances() -> list[dict]:
 
 def create_instance(symbol: str, strategy: str, params: dict, allocation_usd: float,
                     source_tags: list[str] | None = None, selection_thesis: str | None = None,
-                    selection_snapshot: dict | None = None) -> int:
+                    selection_snapshot: dict | None = None, portfolio_id: str | None = None) -> int:
+    """portfolio_id should be passed explicitly by callers that know it (the
+    auto-selector always does). Falls back to bucket_of_tags(source_tags) — the
+    same classification already used everywhere else — so nothing regresses for
+    a caller that doesn't."""
+    if portfolio_id is None:
+        portfolio_id = bucket_of_tags(source_tags)
     with _lock:
         conn = get_conn()
         cur = conn.execute(
             "INSERT INTO instances (symbol, strategy, params, allocation_usd, enabled, created_at,"
-            " source_tags, selection_thesis, selection_snapshot)"
-            " VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            " source_tags, selection_thesis, selection_snapshot, portfolio_id)"
+            " VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
             (symbol.upper(), strategy, json.dumps(params), allocation_usd, time.time(),
              json.dumps(source_tags) if source_tags else None,
-             selection_thesis, json.dumps(selection_snapshot) if selection_snapshot else None),
+             selection_thesis, json.dumps(selection_snapshot) if selection_snapshot else None,
+             portfolio_id),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -333,14 +515,38 @@ def delete_instance(instance_id: int) -> bool:
 
 # ---- orders / decisions / fills ----
 
+def _instance_portfolio(conn: sqlite3.Connection, instance_id: int | None) -> str:
+    """Look up an instance's portfolio_id (must be called with _lock already held).
+    Defaults to Technical/Sustained for a missing/deleted instance, matching
+    bucket_of_tags(None)'s existing default."""
+    if instance_id is not None:
+        row = conn.execute("SELECT portfolio_id FROM instances WHERE id = ?", (instance_id,)).fetchone()
+        if row and row[0]:
+            return row[0]
+    return BUCKET_TECHNICAL_SUSTAINED
+
+
+def _order_portfolio(conn: sqlite3.Connection, order_id: int) -> str:
+    """Must be called with _lock already held."""
+    row = conn.execute("SELECT portfolio_id FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if row and row[0]:
+        return row[0]
+    return BUCKET_TECHNICAL_SUSTAINED
+
+
 def create_order(instance_id: int | None, symbol: str, side: str, qty: float,
                  run_kind: str, note: str | None = None) -> int:
+    """portfolio_id is derived from the instance automatically — callers don't need
+    to pass it (orders always belong to an instance, which already knows its
+    portfolio)."""
     with _lock:
         conn = get_conn()
+        portfolio_id = _instance_portfolio(conn, instance_id)
         cur = conn.execute(
-            "INSERT INTO orders (instance_id, symbol, side, qty, status, run_kind, note, proposed_at)"
-            " VALUES (?, ?, ?, ?, 'proposed', ?, ?, ?)",
-            (instance_id, symbol.upper(), side, qty, run_kind, note, time.time()),
+            "INSERT INTO orders (instance_id, symbol, side, qty, status, run_kind, note, proposed_at,"
+            " portfolio_id)"
+            " VALUES (?, ?, ?, ?, 'proposed', ?, ?, ?, ?)",
+            (instance_id, symbol.upper(), side, qty, run_kind, note, time.time(), portfolio_id),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -372,12 +578,15 @@ def record_decision(order_id: int, verdict: str, size_factor: float,
 
 
 def record_fill(order_id: int, symbol: str, side: str, qty: float, price: float) -> None:
+    """portfolio_id is derived from the order automatically."""
     now = time.time()
     with _lock:
         conn = get_conn()
+        portfolio_id = _order_portfolio(conn, order_id)
         conn.execute(
-            "INSERT INTO fills (order_id, symbol, side, qty, price, ts) VALUES (?, ?, ?, ?, ?, ?)",
-            (order_id, symbol.upper(), side, qty, price, now),
+            "INSERT INTO fills (order_id, symbol, side, qty, price, ts, portfolio_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (order_id, symbol.upper(), side, qty, price, now, portfolio_id),
         )
         conn.execute(
             "UPDATE orders SET status = 'filled', filled_at = ?, fill_price = ? WHERE id = ?",
@@ -403,15 +612,18 @@ def create_plan(instance_id: int | None, symbol: str, entry_order_id: int, qty: 
                 entry_price: float, stop_loss: float, take_profit: float,
                 max_hold_days: int, exit_plan: str, thesis: str,
                 levels_source: str, direction: str = "long") -> int:
+    """portfolio_id is derived from the instance automatically."""
     with _lock:
         conn = get_conn()
+        portfolio_id = _instance_portfolio(conn, instance_id)
         cur = conn.execute(
             "INSERT INTO trade_plans (instance_id, symbol, entry_order_id, qty, entry_price,"
             " opened_at, stop_loss, take_profit, max_hold_days, exit_plan, thesis,"
-            " levels_source, direction)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " levels_source, direction, portfolio_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (instance_id, symbol.upper(), entry_order_id, qty, entry_price, time.time(),
-             stop_loss, take_profit, max_hold_days, exit_plan, thesis, levels_source, direction),
+             stop_loss, take_profit, max_hold_days, exit_plan, thesis, levels_source, direction,
+             portfolio_id),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -508,19 +720,31 @@ def list_plans(status: str = "all", limit: int = 100) -> list[dict]:
 
 # ---- equity / runs ----
 
-def snapshot_equity(equity: float, cash: float) -> None:
+def snapshot_equity(portfolio_id: str, equity: float, cash: float) -> None:
     with _lock:
         conn = get_conn()
         conn.execute(
-            "INSERT OR REPLACE INTO equity_snapshots (ts, equity, cash) VALUES (?, ?, ?)",
-            (time.time(), equity, cash),
+            "INSERT OR REPLACE INTO equity_snapshots (portfolio_id, ts, equity, cash) VALUES (?, ?, ?, ?)",
+            (portfolio_id, time.time(), equity, cash),
         )
         conn.commit()
 
 
-def equity_curve() -> list[dict]:
+def equity_curve(portfolio_id: str) -> list[dict]:
     with _lock:
-        return _rows(get_conn().execute("SELECT * FROM equity_snapshots ORDER BY ts"))
+        return _rows(get_conn().execute(
+            "SELECT * FROM equity_snapshots WHERE portfolio_id = ? ORDER BY ts", (portfolio_id,)
+        ))
+
+
+def equity_curve_legacy() -> list[dict]:
+    """The old pooled account's equity history, preserved read-only from before the
+    per-portfolio split. See _migrate()'s equity_snapshots_legacy rename."""
+    with _lock:
+        try:
+            return _rows(get_conn().execute("SELECT * FROM equity_snapshots_legacy ORDER BY ts"))
+        except sqlite3.OperationalError:
+            return []  # no legacy table — this DB predates pooling or was never migrated
 
 
 def start_run(kind: str) -> int:
@@ -584,22 +808,16 @@ def list_auto_select_runs(limit: int = 50) -> list[dict]:
 
 
 def reset_account() -> None:
-    """Wipe all trading data and restore the account to STARTING_CASH."""
-    global _conn
+    """Nuclear option: reset every portfolio (wipes each one's trading data, restores
+    each to its own starting_cash — see reset_portfolio()) and clears the shared
+    runs/auto-select journal. Prefer reset_portfolio(portfolio_id) to reset one
+    strategy without touching the others."""
+    for p in list_portfolios():
+        reset_portfolio(p["id"])
     with _lock:
         conn = get_conn()
         conn.executescript("""
-            DELETE FROM fills;
-            DELETE FROM decisions;
-            DELETE FROM orders;
-            DELETE FROM trade_plans;
-            DELETE FROM instances;
-            DELETE FROM equity_snapshots;
             DELETE FROM runs;
             DELETE FROM auto_select_runs;
         """)
-        conn.execute(
-            "UPDATE account SET cash = ?, starting_cash = ? WHERE id = 1",
-            (STARTING_CASH, STARTING_CASH),
-        )
         conn.commit()

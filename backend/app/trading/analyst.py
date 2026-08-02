@@ -159,9 +159,12 @@ def _gather_context(order: dict, instance: dict, signal_context: dict,
         }
     except Exception:
         ctx["dealerPositioning"] = "no listed options or data unavailable"
+    # Scoped to this instance's own portfolio — otherwise the analyst would see
+    # cross-portfolio cash/positions that aren't actually available to this trade.
+    portfolio_id = instance.get("portfolio_id") or store.BUCKET_TECHNICAL_SUSTAINED
     ctx["portfolio"] = {
-        "cash": store.get_account()["cash"],
-        "positions": store.get_positions(),
+        "cash": store.get_portfolio(portfolio_id)["cash"],
+        "positions": store.get_positions(portfolio_id),
     }
     return ctx
 

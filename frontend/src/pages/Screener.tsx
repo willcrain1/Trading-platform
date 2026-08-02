@@ -168,6 +168,7 @@ export default function Screener() {
   // deploy
   const [deployTarget, setDeployTarget] = useState<string | null>(null)
   const [deployAlloc, setDeployAlloc] = useState(10000)
+  const [deployPortfolioId, setDeployPortfolioId] = useState<string>('technical_sustained')
   const [deploying, setDeploying] = useState(false)
   const [deployResult, setDeployResult] = useState<AutoDeployResult | null>(null)
   const [deployError, setDeployError] = useState<string | null>(null)
@@ -446,7 +447,7 @@ export default function Screener() {
     if (!deployTarget) return
     setDeploying(true); setDeployError(null); setDeployResult(null)
     try {
-      const res = await api.autoDeploy(deployTarget, deployAlloc)
+      const res = await api.autoDeploy(deployTarget, deployAlloc, deployPortfolioId)
       setDeployResult(res)
     } catch (e) {
       setDeployError((e as Error).message)
@@ -608,6 +609,11 @@ export default function Screener() {
         <input type="number" value={deployAlloc} min={100} step={1000}
           onChange={(e) => setDeployAlloc(Number(e.target.value))}
           style={{ width: 80, fontSize: 12 }} />
+        <select value={deployPortfolioId} onChange={(e) => setDeployPortfolioId(e.target.value)}
+          style={{ fontSize: 12 }}>
+          <option value="smart_buy">Smart Buy</option>
+          <option value="technical_sustained">Technical/Sustained</option>
+        </select>
         <button className="primary" onClick={doDeploy}
           disabled={deploying} style={{ fontSize: 12, padding: '3px 8px' }}>
           {deploying ? '…' : '✓'}

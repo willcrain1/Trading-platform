@@ -25,12 +25,16 @@ Position sizing
   shares         = dollar_risk / (2 × ATR)
   allocation_usd = shares × price  (capped at 10% of equity)
 
-Portfolio balance
-─────────────────
-  Picks are interleaved between two buckets — Smart Buy vs everything else
-  (Technical/Sustained) — so neither exceeds SMART_BUY_MAX_SHARE (50%) of
-  deployed capital. A bucket that runs out of eligible candidates lets the
-  other keep filling remaining cash rather than leaving it idle.
+Portfolios
+──────────
+  Each strategy bucket (Smart Buy, Technical/Sustained) has its own real
+  capital pool and equity curve (see store.py's portfolios table) — no
+  cross-bucket interleaving/balancing is needed since one bucket can never
+  compete with another for the same dollars. Every candidate is tagged with
+  its target portfolioId at gather time (_gather_candidates), and selection/
+  sizing/cash-headroom checks run independently per portfolio. A symbol can
+  be held independently by more than one portfolio at once — see
+  routers/paper.py's overlap endpoint for cross-portfolio visibility.
 """
 from __future__ import annotations
 
@@ -58,7 +62,6 @@ SMART_BUY_MAX_DAYS        = 30    # only use smart-buy alerts from the last N da
 CONGRESS_MIN_ANN_RETURN   = 60.0  # min best-politician annualized return to tag a Technical/
                                    # Sustained pick with "congress" (informational tag only)
 CONGRESS_TAG_MIN_QUALITY  = {"sharp", "mixed"}  # exclude "weak"/"unknown" quality from the tag
-SMART_BUY_MAX_SHARE      = 0.5   # target/cap fraction of deployed capital in the Smart Buy bucket
 SMART_BUY_RSI_ENTRY      = 45    # rsi_revert buyBelow for Smart Buy instances (default is 30) —
                                   # the contrarian thesis is congressional conviction, not a second
                                   # oversold trigger stacked on top, so entry is loosened to convert
@@ -77,19 +80,22 @@ def get_last_result() -> dict:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _open_plan_symbols() -> set[str]:
-    """Symbols with currently open trade plans (already in a trade)."""
-    return {p["symbol"].upper() for p in store.open_plans()}
+def _open_plan_symbols(portfolio_id: str) -> set[str]:
+    """Symbols with a currently open trade plan within this portfolio. Scoped so a
+    symbol another portfolio already holds doesn't block this one — portfolios can
+    independently hold the same symbol now."""
+    return {p["symbol"].upper() for p in store.open_plans() if p.get("portfolio_id") == portfolio_id}
 
 
-def _enabled_instance_symbols() -> set[str]:
-    """Symbols that already have an enabled paper instance."""
-    return {i["symbol"].upper() for i in store.list_instances() if i["enabled"]}
+def _enabled_instance_symbols(portfolio_id: str) -> set[str]:
+    """Symbols that already have an enabled instance within this portfolio."""
+    return {i["symbol"].upper() for i in store.list_instances()
+            if i["enabled"] and i.get("portfolio_id") == portfolio_id}
 
 
-def _get_equity_cash() -> tuple[float, float]:
+def _get_equity_cash(portfolio_id: str) -> tuple[float, float]:
     from .broker import get_active_broker
-    mtm = get_active_broker().mark_to_market()
+    mtm = get_active_broker(portfolio_id).mark_to_market()
     return mtm["equity"], mtm["cash"]
 
 
@@ -101,48 +107,16 @@ def _pick_strategy(signal_type: str, rsi: float | None) -> str:
     return "ema_cross_9_21"  # standard trend-following
 
 
-def _bucket_of(c: dict) -> str:
-    return store.BUCKET_SMART_BUY if c.get("smartBuy") else store.BUCKET_TECHNICAL_SUSTAINED
-
-
 def _existing_bucket_allocation() -> dict[str, float]:
-    """Dollar allocation currently committed to enabled instances, split by source bucket."""
+    """Dollar allocation currently committed to enabled instances, split by portfolio
+    — informational, surfaced in the auto-select journal."""
     totals = {store.BUCKET_SMART_BUY: 0.0, store.BUCKET_TECHNICAL_SUSTAINED: 0.0}
     for inst in store.list_instances():
         if not inst["enabled"]:
             continue
-        totals[store.bucket_of_tags(inst.get("source_tags"))] += inst["allocation_usd"]
+        pid = inst.get("portfolio_id") or store.bucket_of_tags(inst.get("source_tags"))
+        totals[pid] = totals.get(pid, 0.0) + inst["allocation_usd"]
     return totals
-
-
-def _balance_by_bucket(sized: list[dict], existing: dict[str, float]) -> list[dict]:
-    """Interleave sized candidates (each bucket already best-score-first) so Smart Buy
-    doesn't outgrow SMART_BUY_MAX_SHARE of deployed capital at the expense of Technical/
-    Sustained, or vice versa. Each pick goes to whichever bucket is currently further
-    below its target share; a bucket that runs out of eligible candidates lets the other
-    keep filling remaining cash rather than leaving it idle."""
-    smart = [c for c in sized if _bucket_of(c) == store.BUCKET_SMART_BUY]
-    tech  = [c for c in sized if _bucket_of(c) == store.BUCKET_TECHNICAL_SUSTAINED]
-    totals = dict(existing)
-    ordered: list[dict] = []
-    si = ti = 0
-    while si < len(smart) or ti < len(tech):
-        smart_ratio = totals[store.BUCKET_SMART_BUY] / SMART_BUY_MAX_SHARE
-        tech_ratio  = totals[store.BUCKET_TECHNICAL_SUSTAINED] / (1 - SMART_BUY_MAX_SHARE)
-        prefer_smart = smart_ratio <= tech_ratio
-        if prefer_smart and si < len(smart):
-            c = smart[si]; si += 1
-            totals[store.BUCKET_SMART_BUY] += c["_allocation"]
-        elif ti < len(tech):
-            c = tech[ti]; ti += 1
-            totals[store.BUCKET_TECHNICAL_SUSTAINED] += c["_allocation"]
-        elif si < len(smart):
-            c = smart[si]; si += 1
-            totals[store.BUCKET_SMART_BUY] += c["_allocation"]
-        else:
-            break
-        ordered.append(c)
-    return ordered
 
 
 def _size_position(equity: float, price: float, atr: float, smart_buy: bool) -> float:
@@ -322,6 +296,7 @@ def _gather_candidates() -> list[dict]:
             "techScore":   r["score"],
             "streak":      0,
             "smartBuy":    False,
+            "portfolioId": store.BUCKET_TECHNICAL_SUSTAINED,
             "rsi":         r["rsi"],
             "atrPct":      r["atr_pct"],
             "lastPrice":   r["last_price"],
@@ -357,6 +332,7 @@ def _gather_candidates() -> list[dict]:
                 "techScore":  latest["score"],
                 "streak":     streak,
                 "smartBuy":   False,
+                "portfolioId": store.BUCKET_TECHNICAL_SUSTAINED,
                 "rsi":        None,
                 "atrPct":     None,
                 "lastPrice":  None,
@@ -380,6 +356,7 @@ def _gather_candidates() -> list[dict]:
         has_options = bool(r["has_options_activity"])
         if sym in candidates:
             candidates[sym]["smartBuy"] = True
+            candidates[sym]["portfolioId"] = store.BUCKET_SMART_BUY  # overrides technical/sustained
             candidates[sym]["investorQualityScore"] = r["investor_quality_score"]
             candidates[sym]["avgAnnualizedGain"]    = r["avg_annualized_gain"]
             candidates[sym]["maxAnnualizedGain"]    = r["max_ann_gain"]
@@ -392,6 +369,7 @@ def _gather_candidates() -> list[dict]:
                 "techScore":            r["score_at_detection"],
                 "streak":               0,
                 "smartBuy":             True,
+                "portfolioId":          store.BUCKET_SMART_BUY,
                 "rsi":                  None,
                 "atrPct":               None,
                 "lastPrice":            None,
@@ -502,97 +480,87 @@ def run_auto_selection(run_kind: str = "auto") -> dict:
     return result
 
 
-def _select_and_trade(run_kind: str) -> dict:
-    ts = time.time()
-    errors: list[str] = []
-
+def _select_for_portfolio(portfolio_id: str, candidates: list[dict], errors: list[str]) -> dict:
+    """Run selection/sizing for one portfolio's own candidates against its own
+    equity/cash — fully independent of every other portfolio."""
     try:
-        equity, cash = _get_equity_cash()
+        equity, cash = _get_equity_cash(portfolio_id)
     except Exception as e:
-        return {"selected": 0, "errors": [str(e)], "ts": ts}
+        errors.append(f"{portfolio_id}: {e}")
+        return {"selections": [], "candidates": 0, "eligible": 0, "openPositions": 0}
+
+    open_syms = _open_plan_symbols(portfolio_id)
+    own_candidates = [c for c in candidates if c["portfolioId"] == portfolio_id]
 
     if equity <= 0:
-        return {"selected": 0, "errors": ["zero equity"], "ts": ts}
-
-    if cash / equity < MIN_CASH_PCT:
-        log.info("auto-selector: skipping — cash %.1f%% below %.0f%% floor",
-                 cash / equity * 100, MIN_CASH_PCT * 100)
         return {
-            "selected": 0, "skipped": "low_cash",
-            "cash": round(cash, 2), "equity": round(equity, 2), "ts": ts,
+            "selections": [], "candidates": len(own_candidates), "eligible": 0,
+            "equity": round(equity, 2), "cash": round(cash, 2),
+            "openPositions": len(open_syms), "skipped": "zero_equity",
         }
 
-    open_syms     = _open_plan_symbols()
-    instance_syms = _enabled_instance_symbols()
-    blocked       = open_syms | instance_syms
+    if cash / equity < MIN_CASH_PCT:
+        log.info("auto-selector[%s]: skipping — cash %.1f%% below %.0f%% floor",
+                 portfolio_id, cash / equity * 100, MIN_CASH_PCT * 100)
+        return {
+            "selections": [], "candidates": len(own_candidates), "eligible": 0,
+            "equity": round(equity, 2), "cash": round(cash, 2),
+            "openPositions": len(open_syms), "skipped": "low_cash",
+        }
 
-    _run_watchlist_scan()
-    _ensure_smart_buys_fresh()
+    instance_syms = _enabled_instance_symbols(portfolio_id)
+    blocked = open_syms | instance_syms
+    eligible = [c for c in own_candidates if c["symbol"] not in blocked]
 
-    candidates = _gather_candidates()
-    candidates.sort(key=_candidate_score, reverse=True)
-
-    eligible = [c for c in candidates if c["symbol"] not in blocked]
-
-    log.info("auto-selector: %d candidates, %d eligible, %d open positions",
-             len(candidates), len(eligible), len(open_syms))
+    log.info("auto-selector[%s]: %d candidates, %d eligible, %d open positions",
+             portfolio_id, len(own_candidates), len(eligible), len(open_syms))
 
     if not eligible:
         return {
-            "selected": 0, "candidates": len(candidates), "eligible": 0,
+            "selections": [], "candidates": len(own_candidates), "eligible": 0,
             "equity": round(equity, 2), "cash": round(cash, 2),
-            "openPositions": len(open_syms), "ts": ts,
+            "openPositions": len(open_syms),
         }
 
     # Limit batch size to what cash can realistically fund (rough check; engine enforces exactly)
     eligible = eligible[:50]  # safety cap — prevents runaway instance creation on first run
 
-    # Fetch live price + ATR for eligible candidates in parallel
     live: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(_fetch_live, c["symbol"]): c["symbol"] for c in eligible}
         for fut in as_completed(futures):
             live[futures[fut]] = fut.result()
 
-    # Price + size every eligible candidate first (each bucket keeps its score order),
-    # so the bucket balancer below can work with real dollar amounts.
-    sized: list[dict] = []
+    # No balancing needed — this portfolio only ever spends its own cash, up to its
+    # own limits. Just take candidates best-score-first (already sorted by caller).
+    selections: list[dict] = []
     for c in eligible:
         sym = c["symbol"]
-        ld  = live.get(sym, {})
+        ld = live.get(sym, {})
         if not ld:
             errors.append(f"{sym}: no live data")
             continue
         price, atr = ld["price"], ld["atr"]
-        allocation = _size_position(equity, price, atr, c.get("smartBuy", False))
+        smart_buy = c.get("smartBuy", False)
+        allocation = _size_position(equity, price, atr, smart_buy)
         if allocation < price:
             errors.append(f"{sym}: ${allocation:.0f} allocation can't buy 1 share at ${price:.2f}")
             continue
-        c["_price"], c["_atr"], c["_allocation"] = price, atr, allocation
-        sized.append(c)
-
-    ordered = _balance_by_bucket(sized, _existing_bucket_allocation())
-
-    selections: list[dict] = []
-
-    for c in ordered:
-        sym = c["symbol"]
-        price, atr, allocation = c["_price"], c["_atr"], c["_allocation"]
-        smart_buy = c.get("smartBuy", False)
 
         strategy = _pick_strategy(c.get("signalType", "technical"), c.get("rsi"))
         params   = {"buyBelow": SMART_BUY_RSI_ENTRY} if smart_buy else {}
-
-        thesis = _selection_thesis(c)
+        thesis   = _selection_thesis(c)
 
         try:
             iid = store.create_instance(
                 sym, strategy, params, allocation, source_tags=c.get("sources", []),
                 selection_thesis=thesis, selection_snapshot=_selection_snapshot(c),
+                portfolio_id=portfolio_id,
             )
             sel = {
                 "symbol":          sym,
                 "instanceId":      iid,
+                "portfolioId":     portfolio_id,
                 "strategy":        strategy,
                 "allocationUsd":   allocation,
                 "signalType":      c.get("signalType"),
@@ -609,12 +577,44 @@ def _select_and_trade(run_kind: str) -> dict:
                 sel["maxAnnualizedGain"]    = c.get("maxAnnualizedGain")
                 sel["buyCount"]             = c.get("buyCount")
             selections.append(sel)
-            log.info("auto-selector: instance %d %s %s $%.0f (score=%.1f)",
-                     iid, sym, strategy, allocation, sel["compositeScore"])
+            log.info("auto-selector: instance %d %s %s $%.0f (score=%.1f) portfolio=%s",
+                     iid, sym, strategy, allocation, sel["compositeScore"], portfolio_id)
         except Exception as e:
             errors.append(f"{sym}: {e}")
 
-    # Trigger engine to evaluate newly created instances
+    return {
+        "selections": selections, "candidates": len(own_candidates), "eligible": len(eligible),
+        "equity": round(equity, 2), "cash": round(cash, 2), "openPositions": len(open_syms),
+    }
+
+
+def _select_and_trade(run_kind: str) -> dict:
+    ts = time.time()
+    errors: list[str] = []
+
+    _run_watchlist_scan()
+    _ensure_smart_buys_fresh()
+
+    candidates = _gather_candidates()
+    candidates.sort(key=_candidate_score, reverse=True)
+
+    portfolios = store.list_portfolios()
+    selections: list[dict] = []
+    per_portfolio: dict[str, dict] = {}
+    for p in portfolios:
+        outcome = _select_for_portfolio(p["id"], candidates, errors)
+        selections.extend(outcome.pop("selections"))
+        per_portfolio[p["id"]] = outcome
+
+    skip_reasons = {pid: v["skipped"] for pid, v in per_portfolio.items() if v.get("skipped")}
+    overall_skipped = (
+        "; ".join(f"{pid}: {r}" for pid, r in skip_reasons.items())
+        if skip_reasons and len(skip_reasons) == len(portfolios) else None
+    )
+
+    # Trigger engine to evaluate newly created instances — one combined run covers
+    # every portfolio (evaluate_instance routes each instance to its own portfolio's
+    # broker internally, and marks every portfolio to market at the end).
     engine_result: dict = {}
     if selections:
         try:
@@ -623,19 +623,27 @@ def _select_and_trade(run_kind: str) -> dict:
             errors.append(f"engine run: {e}")
             log.exception("auto-selector engine run failed")
 
-    # Use post-trade equity/cash from the engine run when available
-    final_equity = engine_result["equity"] if "equity" in engine_result else equity
-    final_cash   = engine_result["cash"]   if "cash"   in engine_result else cash
+    portfolios_final = engine_result.get("portfolios") or {
+        pid: {"equity": v.get("equity", 0), "cash": v.get("cash", 0)} for pid, v in per_portfolio.items()
+    }
+    final_equity = engine_result["equity"] if "equity" in engine_result else round(
+        sum(v.get("equity", 0) for v in per_portfolio.values()), 2
+    )
+    final_cash = engine_result["cash"] if "cash" in engine_result else round(
+        sum(v.get("cash", 0) for v in per_portfolio.values()), 2
+    )
 
     result = {
         "selected":      len(selections),
         "candidates":    len(candidates),
-        "eligible":      len(eligible),
+        "eligible":      sum(v.get("eligible", 0) for v in per_portfolio.values()),
         "selections":    selections,
         "errors":        errors,
+        "skipped":       overall_skipped,
+        "portfolios":    portfolios_final,
         "equity":        round(final_equity, 2),
         "cash":          round(final_cash, 2),
-        "openPositions": len(open_syms),
+        "openPositions": sum(v.get("openPositions", 0) for v in per_portfolio.values()),
         "engineResult":  engine_result,
         "ts":            ts,
     }

@@ -1,5 +1,6 @@
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ from pydantic import BaseModel, Field
 from ..analysis import backtest
 from ..data import client as data_client
 from ..trading import engine, scheduler, store
-from ..trading.broker import get_active_broker, paper_broker
+from ..trading.broker import get_active_broker
 
 router = APIRouter(prefix="/api/paper", tags=["paper"])
 
@@ -19,6 +20,7 @@ class InstanceCreate(BaseModel):
     strategy: str
     params: dict = {}
     allocationUsd: float = Field(gt=0, le=1_000_000)
+    portfolioId: str
 
 
 class InstanceUpdate(BaseModel):
@@ -33,20 +35,56 @@ class RunRequest(BaseModel):
 
 @router.get("/account")
 def account():
-    mtm = get_active_broker().mark_to_market()
-    acc = store.get_account()
-    return {
-        **mtm,
-        "startingCash": acc["starting_cash"],
-        "totalPnl": round(mtm["equity"] - acc["starting_cash"], 2),
-        "totalPnlPct": round((mtm["equity"] / acc["starting_cash"] - 1) * 100, 3),
-        "schedulerJobs": scheduler.job_info(),
+    """Per-portfolio account state, plus a combined view summing across every
+    portfolio. Combined positions are each tagged with their source portfolioId
+    rather than blended, so two portfolios independently holding the same symbol
+    stay visible as two rows (see /overlap for a dedicated side-by-side view)."""
+    portfolios: dict[str, dict] = {}
+    combined_equity = combined_cash = combined_starting_cash = combined_starting_equity = 0.0
+    combined_positions: list[dict] = []
+
+    for p in store.list_portfolios():
+        pid = p["id"]
+        mtm = get_active_broker(pid).mark_to_market()
+        starting_cash = p["starting_cash"]
+        # starting_equity is the day-1 TOTAL value baseline (cash + any carried-over
+        # open positions at creation) — falls back to starting_cash for the normal
+        # case of a portfolio that began with no positions, where the two are equal.
+        starting_equity = p["starting_equity"] if p["starting_equity"] is not None else starting_cash
+        portfolios[pid] = {
+            **mtm,
+            "label": p["label"],
+            "startingCash": starting_cash,
+            "startingEquity": starting_equity,
+            "totalPnl": round(mtm["equity"] - starting_equity, 2),
+            "totalPnlPct": round((mtm["equity"] / starting_equity - 1) * 100, 3) if starting_equity else None,
+        }
+        combined_equity += mtm["equity"]
+        combined_cash += mtm["cash"]
+        combined_starting_cash += starting_cash
+        combined_starting_equity += starting_equity
+        combined_positions.extend({**pos, "portfolioId": pid} for pos in mtm["positions"])
+
+    combined = {
+        "equity": round(combined_equity, 2),
+        "cash": round(combined_cash, 2),
+        "positions": combined_positions,
+        "startingCash": round(combined_starting_cash, 2),
+        "startingEquity": round(combined_starting_equity, 2),
+        "totalPnl": round(combined_equity - combined_starting_equity, 2),
+        "totalPnlPct": (
+            round((combined_equity / combined_starting_equity - 1) * 100, 3) if combined_starting_equity else None
+        ),
     }
+    return {"portfolios": portfolios, "combined": combined, "schedulerJobs": scheduler.job_info()}
 
 
 @router.get("/equity")
 def equity():
-    return {"curve": store.equity_curve()}
+    """Per-portfolio equity curves, plus the pre-split pooled account's history
+    (equity_snapshots_legacy) preserved read-only for reference."""
+    portfolios = {p["id"]: {"curve": store.equity_curve(p["id"])} for p in store.list_portfolios()}
+    return {"portfolios": portfolios, "legacy": {"curve": store.equity_curve_legacy()}}
 
 
 @router.get("/orders")
@@ -75,7 +113,12 @@ def instances():
 def create_instance(req: InstanceCreate):
     if req.strategy not in backtest.STRATEGIES:
         raise HTTPException(400, f"unknown strategy '{req.strategy}'")
-    iid = store.create_instance(req.symbol, req.strategy, req.params, req.allocationUsd)
+    try:
+        store.get_portfolio(req.portfolioId)
+    except ValueError:
+        raise HTTPException(400, f"unknown portfolio '{req.portfolioId}'")
+    iid = store.create_instance(req.symbol, req.strategy, req.params, req.allocationUsd,
+                                portfolio_id=req.portfolioId)
     return {"id": iid}
 
 
@@ -108,11 +151,16 @@ class AutoDeployRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=12)
     allocationUsd: float = Field(gt=0, le=1_000_000)
     period: str = "2y"
+    portfolioId: str
 
 
 @router.post("/auto-deploy")
 def auto_deploy(req: AutoDeployRequest):
     """Backtest all strategies for a ticker, pick the best Sharpe, create instance."""
+    try:
+        store.get_portfolio(req.portfolioId)
+    except ValueError:
+        raise HTTPException(400, f"unknown portfolio '{req.portfolioId}'")
     symbol = req.symbol.upper().strip()
     period = req.period if req.period in {"1y", "2y", "3y", "5y"} else "2y"
 
@@ -147,8 +195,8 @@ def auto_deploy(req: AutoDeployRequest):
         )
     best = max(valid, key=lambda r: r["sharpe"])
 
-    # check cash headroom
-    cash = get_active_broker().get_cash()
+    # check cash headroom against the target portfolio's own cash, not the whole account
+    cash = get_active_broker(req.portfolioId).get_cash()
     if req.allocationUsd > cash:
         raise HTTPException(
             400,
@@ -156,10 +204,12 @@ def auto_deploy(req: AutoDeployRequest):
             "Reduce allocation or add funds.",
         )
 
-    iid = store.create_instance(symbol, best["strategy"], {}, req.allocationUsd)
+    iid = store.create_instance(symbol, best["strategy"], {}, req.allocationUsd,
+                                portfolio_id=req.portfolioId)
     return {
         "instanceId": iid,
         "symbol": symbol,
+        "portfolioId": req.portfolioId,
         "strategy": best["strategy"],
         "strategyLabel": best.get("label", best["strategy"]),
         "sharpe": best["sharpe"],
@@ -220,10 +270,55 @@ def health_check():
 
 
 @router.post("/reset")
-def reset():
-    """Wipe all paper trading data and restore the account to STARTING_CASH."""
-    store.reset_account()
-    return {"ok": True, "cash": store.STARTING_CASH}
+def reset(portfolio: str | None = None, confirm: str | None = None):
+    """Wipe one portfolio's trading data and restore it to its own starting_cash —
+    every other portfolio is untouched. Pass confirm=all instead of portfolio to
+    reset every portfolio at once (the old whole-account-reset behavior)."""
+    if confirm == "all":
+        store.reset_account()
+        return {"ok": True, "resetAll": True}
+    if not portfolio:
+        raise HTTPException(400, "portfolio is required (or pass confirm=all to reset everything)")
+    try:
+        store.reset_portfolio(portfolio)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"ok": True, "portfolio": portfolio}
+
+
+@router.get("/overlap")
+def overlap():
+    """Symbols currently held independently by more than one portfolio, with each
+    portfolio's own entry price/date/direction/thesis side by side — the
+    cross-portfolio visibility needed since portfolios can now hold the same
+    symbol at once."""
+    by_symbol: dict[str, list[dict]] = {}
+    for p in store.open_plans():
+        by_symbol.setdefault(p["symbol"], []).append(p)
+
+    overlaps = []
+    for symbol, plans_for_symbol in by_symbol.items():
+        portfolios_involved = {p.get("portfolio_id") for p in plans_for_symbol}
+        if len(portfolios_involved) < 2:
+            continue
+        overlaps.append({
+            "symbol": symbol,
+            "portfolios": [
+                {
+                    "portfolioId": p.get("portfolio_id"),
+                    "planId": p["id"],
+                    "entryPrice": p["entry_price"],
+                    "openedAt": p["opened_at"],
+                    "direction": p.get("direction", "long"),
+                    "qty": p["qty"],
+                    "stopLoss": p["stop_loss"],
+                    "takeProfit": p["take_profit"],
+                    "thesis": p.get("thesis"),
+                }
+                for p in plans_for_symbol
+            ],
+        })
+    return {"overlaps": overlaps, "count": len(overlaps)}
 
 
 @router.get("/plans")
@@ -355,16 +450,69 @@ def _spy_benchmark(start_ts: float, end_ts: float) -> dict:
         return {"totalReturnPct": None, "annualizedReturnPct": None, "years": None}
 
 
-def _bucket_stats_with_performance(closed: list[dict], unrealized_pnl: float) -> dict:
+REAL_CURVE_MIN_DAILY_POINTS = 10  # below this, a portfolio's real equity curve is too
+                                   # sparse to trust — fall back to the trade-compounding proxy
+
+
+def _real_portfolio_performance(portfolio_id: str) -> dict | None:
+    """Sharpe / max drawdown / CAGR from the portfolio's own real equity_snapshots,
+    resampled to one point per calendar day (last snapshot of the day) to avoid the
+    noise of many intraday snapshots. Returns None below REAL_CURVE_MIN_DAILY_POINTS —
+    too little real history yet; caller falls back to _bucket_performance()'s
+    compounded-trade-returns proxy, same as every portfolio starts out using."""
+    curve = store.equity_curve(portfolio_id)
+    if not curve:
+        return None
+    daily: dict[str, dict] = {}
+    for pt in curve:
+        day = datetime.utcfromtimestamp(pt["ts"]).strftime("%Y-%m-%d")
+        daily[day] = pt  # curve is ts-ascending, so the last write per day wins
+    points = sorted(daily.values(), key=lambda p: p["ts"])
+    if len(points) < REAL_CURVE_MIN_DAILY_POINTS:
+        return None
+
+    eq_vals = pd.Series([p["equity"] for p in points])
+    rets = eq_vals.pct_change().dropna()
+    start_ts, end_ts = points[0]["ts"], points[-1]["ts"]
+    years = (end_ts - start_ts) / (365.25 * 86400)
+    if years <= 0 or eq_vals.iloc[0] <= 0:
+        return None
+
+    max_dd_pct = round(float((eq_vals / eq_vals.cummax() - 1).min() * 100), 2)
+    sharpe = None
+    if len(rets) >= 4 and rets.std() > 0:
+        sharpe = round(float(rets.mean() / rets.std() * np.sqrt(252)), 2)
+    total_return_pct = round((eq_vals.iloc[-1] / eq_vals.iloc[0] - 1) * 100, 2)
+    annualized_pct = (
+        round(((eq_vals.iloc[-1] / eq_vals.iloc[0]) ** (1 / years) - 1) * 100, 2)
+        if years >= (30 / 365.25) else None
+    )
+    return {
+        "sharpe": sharpe,
+        "maxDrawdownPct": max_dd_pct,
+        "annualizedReturnPct": annualized_pct,
+        "totalReturnPct": total_return_pct,
+        "periodYears": round(years, 2),
+        "periodStartTs": start_ts,
+        "periodEndTs": end_ts,
+    }
+
+
+def _bucket_stats_with_performance(closed: list[dict], unrealized_pnl: float,
+                                   portfolio_id: str | None = None) -> dict:
     stats = _trade_stats(closed)
     stats["unrealizedPnl"] = round(unrealized_pnl, 2)
 
-    perf = _bucket_performance(closed)
+    perf = _real_portfolio_performance(portfolio_id) if portfolio_id else None
+    real_curve = perf is not None
+    if perf is None:
+        perf = _bucket_performance(closed)
     stats["sharpe"] = perf["sharpe"]
     stats["maxDrawdownPct"] = perf["maxDrawdownPct"]
     stats["annualizedReturnPct"] = perf["annualizedReturnPct"]
     stats["totalReturnPct"] = perf["totalReturnPct"]
     stats["periodYears"] = perf["periodYears"]
+    stats["performanceSource"] = "equityCurve" if real_curve else "compoundedTrades"
 
     bench = {"annualizedReturnPct": None, "totalReturnPct": None}
     if perf["periodStartTs"] is not None and perf["periodEndTs"] is not None:
@@ -376,35 +524,38 @@ def _bucket_stats_with_performance(closed: list[dict], unrealized_pnl: float) ->
 
 @router.get("/stats")
 def paper_stats():
-    """Realized-trade stats broken out by portfolio-balance bucket (all / Smart Buy /
-    Technical+Sustained), plus unrealized P&L on currently open positions per bucket.
+    """Realized-trade stats broken out by portfolio (all / Smart Buy /
+    Technical+Sustained), plus unrealized P&L on currently open positions per portfolio.
 
-    Sharpe, max drawdown, annualized return, and the S&P 500 comparison are each
-    computed from that bucket's own closed trades (see _bucket_performance), so they
-    differ across All / Smart Buy / Technical+Sustained rather than being frozen at
-    a single whole-account number.
+    Sharpe/drawdown/CAGR prefer each portfolio's own real equity curve once it has
+    enough history (see _real_portfolio_performance), falling back to the
+    compounded-closed-trade-returns proxy (_bucket_performance) until then — the
+    "all" bucket spans two portfolios so it always uses the trade-based proxy, since
+    there's no single combined equity curve to draw from.
     """
     all_closed = store.list_plans(status="closed", limit=500)
 
     by_bucket: dict[str, list[dict]] = {store.BUCKET_SMART_BUY: [], store.BUCKET_TECHNICAL_SUSTAINED: []}
     for p in all_closed:
-        by_bucket[store.bucket_of_tags(p.get("source_tags"))].append(p)
+        pid = p.get("portfolio_id") or store.bucket_of_tags(p.get("source_tags"))
+        by_bucket.setdefault(pid, []).append(p)
 
-    # Unrealized P&L on currently open positions, joined to their bucket via source_tags
-    mtm = get_active_broker().mark_to_market()
-    plan_by_symbol = {p["symbol"]: p for p in store.open_plans()}
-    unrealized = {store.BUCKET_SMART_BUY: 0.0, store.BUCKET_TECHNICAL_SUSTAINED: 0.0}
-    for pos in mtm["positions"]:
-        plan = plan_by_symbol.get(pos["symbol"])
-        bucket = store.bucket_of_tags(plan.get("source_tags")) if plan else store.BUCKET_TECHNICAL_SUSTAINED
-        unrealized[bucket] += pos["unrealizedPnl"]
+    # Unrealized P&L per portfolio, from each portfolio's own mark-to-market — correct
+    # even if two portfolios independently hold the same symbol, since each portfolio's
+    # positions are derived only from its own fills.
+    unrealized: dict[str, float] = {}
+    for p in store.list_portfolios():
+        mtm = get_active_broker(p["id"]).mark_to_market()
+        unrealized[p["id"]] = round(sum(pos["unrealizedPnl"] for pos in mtm["positions"]), 2)
 
     return {
         "all": _bucket_stats_with_performance(all_closed, sum(unrealized.values())),
         "smartBuy": _bucket_stats_with_performance(
-            by_bucket[store.BUCKET_SMART_BUY], unrealized[store.BUCKET_SMART_BUY]
+            by_bucket.get(store.BUCKET_SMART_BUY, []), unrealized.get(store.BUCKET_SMART_BUY, 0.0),
+            portfolio_id=store.BUCKET_SMART_BUY,
         ),
         "technicalSustained": _bucket_stats_with_performance(
-            by_bucket[store.BUCKET_TECHNICAL_SUSTAINED], unrealized[store.BUCKET_TECHNICAL_SUSTAINED]
+            by_bucket.get(store.BUCKET_TECHNICAL_SUSTAINED, []), unrealized.get(store.BUCKET_TECHNICAL_SUSTAINED, 0.0),
+            portfolio_id=store.BUCKET_TECHNICAL_SUSTAINED,
         ),
     }

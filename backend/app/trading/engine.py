@@ -65,10 +65,12 @@ def _desired_position(instance: dict) -> tuple[float, dict]:
     return desired, context
 
 
-def _held_qty(symbol: str) -> float:
-    """Signed qty: positive = long, negative = short, 0 = flat."""
+def _held_qty(symbol: str, portfolio_id: str) -> float:
+    """Signed qty within one portfolio: positive = long, negative = short, 0 = flat.
+    Scoped so two portfolios independently holding the same symbol never see each
+    other's position."""
     return next(
-        (p["qty"] for p in get_active_broker().get_positions() if p["symbol"] == symbol.upper()),
+        (p["qty"] for p in get_active_broker(portfolio_id).get_positions() if p["symbol"] == symbol.upper()),
         0.0,
     )
 
@@ -173,8 +175,9 @@ def _clamp_levels(verdict: dict, price: float, context: dict, defaults: dict,
 def evaluate_instance(instance: dict, run_kind: str) -> dict:
     """Evaluate one instance; return a result dict for the run log."""
     symbol = instance["symbol"]
+    portfolio_id = instance.get("portfolio_id") or store.BUCKET_TECHNICAL_SUSTAINED
     desired, context = _desired_position(instance)
-    held = _held_qty(symbol)  # positive=long, negative=short, 0=flat
+    held = _held_qty(symbol, portfolio_id)  # positive=long, negative=short, 0=flat
 
     # ── determine action ──────────────────────────────────────────────────────
     if desired > 0 and held == 0:
@@ -229,7 +232,7 @@ def evaluate_instance(instance: dict, run_kind: str) -> dict:
 
     store.set_order_status(order_id, "approved", qty=float(sized_qty))
     try:
-        fill = get_active_broker().submit_market_order(order_id, symbol, side, float(sized_qty))
+        fill = get_active_broker(portfolio_id).submit_market_order(order_id, symbol, side, float(sized_qty))
     except OrderRejected as e:
         store.set_order_status(order_id, "error", note=str(e))
         raise
@@ -258,9 +261,11 @@ def evaluate_instance(instance: dict, run_kind: str) -> dict:
         return {"symbol": symbol, "action": "filled", "orderId": order_id,
                 "planId": plan_id, "direction": direction, **fill}
 
-    # Closing a position (sell or cover)
+    # Closing a position (sell or cover). Scoped to this instance's own portfolio —
+    # portfolios can independently hold the same symbol now, so a plan in a
+    # different portfolio for the same symbol must never be touched here.
     for plan in store.open_plans():
-        if plan["symbol"] == symbol.upper():
+        if plan["symbol"] == symbol.upper() and plan.get("portfolio_id") == portfolio_id:
             store.close_plan(plan["id"], order_id, fill["fillPrice"], "signal_exit")
     return {"symbol": symbol, "action": "filled", "orderId": order_id,
             "direction": direction, **fill}
@@ -290,7 +295,14 @@ def run_engine(run_kind: str) -> dict:
         vetoed += res["action"] == "vetoed"
     proposed += len(exit_result["exited"])
     filled += len(exit_result["exited"])
-    mtm = get_active_broker().mark_to_market()
+
+    # Mark every portfolio to market — cheap (a handful of portfolios), and simpler
+    # and more robust than tracking exactly which ones this specific run touched.
+    portfolios_mtm: dict[str, dict] = {}
+    for p in store.list_portfolios():
+        mtm = get_active_broker(p["id"]).mark_to_market()
+        portfolios_mtm[p["id"]] = {"equity": mtm["equity"], "cash": mtm["cash"]}
+
     store.finish_run(run_id, proposed, filled, vetoed, errors)
     return {
         "runId": run_id,
@@ -298,6 +310,7 @@ def run_engine(run_kind: str) -> dict:
         "results": results,
         "exits": exit_result["exited"],
         "errors": errors,
-        "equity": mtm["equity"],
-        "cash": mtm["cash"],
+        "portfolios": portfolios_mtm,
+        "equity": round(sum(v["equity"] for v in portfolios_mtm.values()), 2),
+        "cash": round(sum(v["cash"] for v in portfolios_mtm.values()), 2),
     }

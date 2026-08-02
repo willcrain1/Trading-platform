@@ -6,7 +6,9 @@ import {
   type PaperAccount,
   type PaperInstance,
   type PaperOrder,
+  type PaperOverlapEntry,
   type PaperPlan,
+  type PaperPortfolio,
   type PaperRun,
   type Point,
   type ScanResult,
@@ -53,8 +55,33 @@ const SOURCE_FILTER_LABELS: Record<SourceFilter, string> = {
   technicalSustained: 'Technical/Sustained',
 }
 
+const PORTFOLIO_ID_FOR_FILTER: Record<Exclude<SourceFilter, 'all'>, string> = {
+  smartBuy: 'smart_buy',
+  technicalSustained: 'technical_sustained',
+}
+
 function bucketOfTags(tags: string[] | null | undefined): 'smartBuy' | 'technicalSustained' {
   return tags && tags.includes('smart_buy') ? 'smartBuy' : 'technicalSustained'
+}
+
+// Merges multiple portfolios' equity curves into one combined series by
+// carrying each portfolio's last-known value forward and summing at every
+// timestamp any portfolio snapshotted at (engine runs mark all portfolios
+// to market together, so most timestamps line up across portfolios).
+function combineCurves(curves: Point[][]): Point[] {
+  const allTimes = [...new Set(curves.flatMap((c) => c.map((p) => p.time)))].sort((a, b) => a - b)
+  return allTimes.map((time) => {
+    let sum = 0
+    for (const c of curves) {
+      let val: number | undefined
+      for (const p of c) {
+        if (p.time > time) break
+        val = p.value
+      }
+      sum += val ?? 0
+    }
+    return { time, value: sum }
+  })
 }
 
 function SourceBadges({ tags, onPoliticianClick }: { tags: string[]; onPoliticianClick?: () => void }) {
@@ -105,7 +132,9 @@ function NameSub({ sym, names }: { sym: string; names: Record<string, string> })
 
 export default function PaperTrading() {
   const [account, setAccount] = useState<PaperAccount | null>(null)
-  const [equity, setEquity] = useState<Point[]>([])
+  const [portfolioEquity, setPortfolioEquity] = useState<Record<string, Point[]>>({})
+  const [legacyEquity, setLegacyEquity] = useState<Point[]>([])
+  const [overlaps, setOverlaps] = useState<PaperOverlapEntry[]>([])
   const [orders, setOrders] = useState<PaperOrder[]>([])
   const [runs, setRuns] = useState<PaperRun[]>([])
   const [instances, setInstances] = useState<PaperInstance[]>([])
@@ -119,6 +148,7 @@ export default function PaperTrading() {
   const [newSymbol, setNewSymbol] = useState('')
   const [newStrategy, setNewStrategy] = useState('sma_cross')
   const [newAllocation, setNewAllocation] = useState(10000)
+  const [newPortfolioId, setNewPortfolioId] = useState<string>('technical_sustained')
 
   const [healthRunning, setHealthRunning] = useState(false)
   const [healthResults, setHealthResults] = useState<HealthCheckRow[] | null>(null)
@@ -139,9 +169,10 @@ export default function PaperTrading() {
 
   const refresh = useCallback(async () => {
     try {
-      const [acc, eq, ords, rns, inst, plans] = await Promise.all([
+      const [acc, eq, ovl, ords, rns, inst, plans] = await Promise.all([
         api.paperAccount(),
         api.paperEquity(),
+        api.paperOverlap(),
         api.paperOrders(),
         api.paperRuns(),
         api.paperInstances(),
@@ -150,16 +181,26 @@ export default function PaperTrading() {
       setAccount(acc)
       // dedupe to one point per second — lightweight-charts requires strictly
       // ascending unique timestamps, and fills can snapshot within the same second
-      const bySecond = new Map<number, number>()
-      for (const p of eq.curve) bySecond.set(Math.floor(p.ts), p.equity)
-      setEquity([...bySecond.entries()].map(([time, value]) => ({ time, value })))
+      const nextPortfolioEquity: Record<string, Point[]> = {}
+      for (const pid of Object.keys(eq.portfolios)) {
+        const bySecond = new Map<number, number>()
+        for (const p of eq.portfolios[pid].curve) bySecond.set(Math.floor(p.ts), p.equity)
+        nextPortfolioEquity[pid] = [...bySecond.entries()]
+          .map(([time, value]) => ({ time, value }))
+          .sort((a, b) => a.time - b.time)
+      }
+      setPortfolioEquity(nextPortfolioEquity)
+      const legacyBySecond = new Map<number, number>()
+      for (const p of eq.legacy.curve) legacyBySecond.set(Math.floor(p.ts), p.equity)
+      setLegacyEquity([...legacyBySecond.entries()].map(([time, value]) => ({ time, value })).sort((a, b) => a.time - b.time))
+      setOverlaps(ovl.overlaps)
       setOrders(ords.orders)
       setRuns(rns.runs)
       setInstances(inst.instances)
       setOpenPlans(plans.plans)
       setError(null)
       const allSyms = [...new Set([
-        ...acc.positions.map((p) => p.symbol),
+        ...acc.combined.positions.map((p) => p.symbol),
         ...inst.instances.map((i) => i.symbol),
         ...ords.orders.map((o) => o.symbol),
       ])]
@@ -201,6 +242,7 @@ export default function PaperTrading() {
         symbol: newSymbol.trim().toUpperCase(),
         strategy: newStrategy,
         allocationUsd: newAllocation,
+        portfolioId: newPortfolioId,
       })
       setNewSymbol('')
       await refresh()
@@ -220,7 +262,7 @@ export default function PaperTrading() {
     }
     setError(null)
     try {
-      const res = await api.autoDeploy(sym, newAllocation)
+      const res = await api.autoDeploy(sym, newAllocation, newPortfolioId)
       setAutoDeployResult(res)
       if (!symbol) setNewSymbol('')
       await refresh()
@@ -270,23 +312,37 @@ export default function PaperTrading() {
     }
   }
 
+  const activePortfolio: PaperPortfolio | null = account
+    ? (sourceFilter === 'all' ? account.combined : account.portfolios[PORTFOLIO_ID_FOR_FILTER[sourceFilter]])
+    : null
+
+  const equity = useMemo(() => {
+    if (sourceFilter === 'all') {
+      const combined = combineCurves(Object.values(portfolioEquity))
+      // The per-portfolio curves only start from the day portfolios were split out
+      // of the old pooled account — splice the preserved pre-split pooled history
+      // (equity_snapshots_legacy) onto the front so "All sources" still shows the
+      // full history instead of just the last few hours.
+      const cutoff = combined.length > 0 ? combined[0].time : Infinity
+      return [...legacyEquity.filter((p) => p.time < cutoff), ...combined]
+    }
+    return portfolioEquity[PORTFOLIO_ID_FOR_FILTER[sourceFilter]] ?? []
+  }, [portfolioEquity, legacyEquity, sourceFilter])
+
   const equityLines = useMemo(
     () => (equity.length > 1 ? [{ points: equity, color: '#58a6ff', title: 'Equity' }] : []),
     [equity],
   )
 
   const lastRun = runs[0]
-  const pnlTone = account && account.totalPnl >= 0 ? 'pos' : 'neg'
+  const pnlTone = activePortfolio && activePortfolio.totalPnl >= 0 ? 'pos' : 'neg'
 
-  const enrichedPositions = (account?.positions ?? []).map((p) => {
+  const enrichedPositions = (activePortfolio?.positions ?? []).map((p) => {
     const plan = openPlans.find((pl) => pl.symbol === p.symbol)
     const pctChg = p.last != null && p.avgCost ? (p.last / p.avgCost - 1) * 100 : null
     return { ...p, plan, pctChg }
   })
-  const displayedPositions = (sourceFilter === 'all'
-    ? enrichedPositions
-    : enrichedPositions.filter((p) => bucketOfTags(p.plan?.source_tags) === sourceFilter)
-  ).slice().sort((a, b) => {
+  const displayedPositions = enrichedPositions.slice().sort((a, b) => {
     const { key, dir } = posSort
     const mul = dir === 'asc' ? 1 : -1
     if (key === 'symbol') return mul * a.symbol.localeCompare(b.symbol)
@@ -338,17 +394,25 @@ export default function PaperTrading() {
           {!resetConfirm ? (
             <button style={{ fontSize: 12, padding: '3px 10px', color: '#f85149', borderColor: '#f8514955' }}
               onClick={() => setResetConfirm(true)}>
-              Reset account
+              {sourceFilter === 'all' ? 'Reset account' : `Reset ${SOURCE_FILTER_LABELS[sourceFilter]}`}
             </button>
           ) : (
             <>
-              <span style={{ fontSize: 12, color: '#f85149' }}>Wipe all trades and restore $20k?</span>
+              <span style={{ fontSize: 12, color: '#f85149' }}>
+                {sourceFilter === 'all'
+                  ? 'Wipe ALL portfolios and restore starting cash?'
+                  : `Wipe the ${SOURCE_FILTER_LABELS[sourceFilter]} portfolio and restore its starting cash?`}
+              </span>
               <button style={{ fontSize: 12, padding: '3px 10px', background: '#f85149', color: '#fff', borderColor: '#f85149' }}
                 disabled={resetting}
                 onClick={async () => {
                   setResetting(true)
                   try {
-                    await api.paperReset()
+                    if (sourceFilter === 'all') {
+                      await api.paperResetAll()
+                    } else {
+                      await api.paperReset(PORTFOLIO_ID_FOR_FILTER[sourceFilter])
+                    }
                     setResetConfirm(false)
                     setLastRunResult(null)
                     setHealthResults(null)
@@ -449,16 +513,18 @@ export default function PaperTrading() {
         </div>
       )}
 
-      {account && (
+      {account && activePortfolio && (
         <div className="tiles">
-          <StatTile label="Equity" value={fmtUsd(account.equity)}
-            tooltip="Total account value: cash plus all open positions marked at the latest quotes. Started at $20,000 of simulated money." />
-          <StatTile label="Cash" value={fmtUsd(account.cash)}
+          <StatTile label="Equity" value={fmtUsd(activePortfolio.equity)}
+            tooltip={sourceFilter === 'all'
+              ? "Combined value across all portfolios: cash plus all open positions marked at the latest quotes."
+              : `Total value of the ${SOURCE_FILTER_LABELS[sourceFilter]} portfolio: its own cash plus its own open positions.`} />
+          <StatTile label="Cash" value={fmtUsd(activePortfolio.cash)}
             tooltip="Uninvested simulated cash. Buys are rejected if they exceed available cash — no margin or leverage in this simulator." />
-          <StatTile label="Total P&L" value={`${fmtUsd(account.totalPnl)} (${account.totalPnlPct}%)`} tone={pnlTone}
-            tooltip="Equity minus starting cash — combined realized and unrealized profit/loss since the account began." />
-          <StatTile label="Open positions" value={account.positions.length}
-            tooltip="Number of tickers currently held. Each strategy instance holds at most one long position in its ticker (long/flat, no shorting)." />
+          <StatTile label="Total P&L" value={`${fmtUsd(activePortfolio.totalPnl)} (${activePortfolio.totalPnlPct != null ? activePortfolio.totalPnlPct : '—'}%)`} tone={pnlTone}
+            tooltip="Equity minus starting equity — combined realized and unrealized profit/loss since this portfolio began." />
+          <StatTile label="Open positions" value={activePortfolio.positions.length}
+            tooltip="Number of tickers currently held in this view. Each strategy instance holds at most one long position in its ticker (long/flat, no shorting)." />
           <StatTile
             label="Next scheduled run"
             value={account.schedulerJobs.length > 0
@@ -529,7 +595,10 @@ export default function PaperTrading() {
       <div className="controls" style={{ marginBottom: 10 }}>
         {(['all', 'smartBuy', 'technicalSustained'] as SourceFilter[]).map((f) => (
           <button key={f} className={sourceFilter === f ? 'primary' : ''}
-            onClick={() => setSourceFilter(f)}>
+            onClick={() => {
+              setSourceFilter(f)
+              if (f !== 'all') setNewPortfolioId(PORTFOLIO_ID_FOR_FILTER[f])
+            }}>
             {SOURCE_FILTER_LABELS[f]}
           </button>
         ))}
@@ -590,6 +659,39 @@ export default function PaperTrading() {
           )}
       </div>
 
+      {overlaps.length > 0 && (
+        <div className="panel" style={{ marginBottom: 16 }}>
+          <h2>
+            Overlap
+            <Tip text="Symbols held independently by more than one portfolio at the same time. Portfolios don't block each other from trading the same ticker — this table shows where their positions diverge (entry price, direction, sizing) so you can see how the strategies actually differ." />
+          </h2>
+          <table className="data">
+            <thead>
+              <tr><th>Symbol</th><th>Portfolio</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Target</th><th>Opened</th></tr>
+            </thead>
+            <tbody>
+              {overlaps.map((o) => o.portfolios.map((p, i) => (
+                <tr key={`${o.symbol}-${p.portfolioId}`}>
+                  {i === 0 && (
+                    <td rowSpan={o.portfolios.length}>
+                      <strong>{o.symbol}</strong>
+                      <NameSub sym={o.symbol} names={names} />
+                    </td>
+                  )}
+                  <td>{account?.portfolios[p.portfolioId]?.label ?? p.portfolioId}</td>
+                  <td className={p.direction === 'long' ? 'pos' : 'neg'}>{p.direction.toUpperCase()}</td>
+                  <td>{p.qty}</td>
+                  <td>{p.entryPrice.toFixed(2)}</td>
+                  <td className="neg">{p.stopLoss.toFixed(2)}</td>
+                  <td className="pos">{p.takeProfit.toFixed(2)}</td>
+                  <td>{fmtTime(p.openedAt)}</td>
+                </tr>
+              )))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div className="panel" style={{ marginBottom: 16 }}>
           <h2>
             Strategy instances
@@ -603,6 +705,16 @@ export default function PaperTrading() {
                 onKeyDown={(e) => e.key === 'Enter' && handleAutoDeploy()} />
               <input type="number" value={newAllocation} min={100} step={500}
                 onChange={(e) => setNewAllocation(Number(e.target.value))} style={{ width: 100 }} />
+              <select value={newPortfolioId} onChange={(e) => setNewPortfolioId(e.target.value)}>
+                {account && Object.keys(account.portfolios).length > 0
+                  ? Object.entries(account.portfolios).map(([pid, p]) => (
+                      <option key={pid} value={pid}>{p.label ?? pid}</option>
+                    ))
+                  : (['smart_buy', 'technical_sustained'] as const).map((pid) => (
+                      <option key={pid} value={pid}>{SOURCE_FILTER_LABELS[pid === 'smart_buy' ? 'smartBuy' : 'technicalSustained']}</option>
+                    ))}
+              </select>
+              <Tip text="Which portfolio's own cash this new instance draws from. Portfolios are fully independent — capital, positions, and P&L never cross over between them." />
               <button className="primary" onClick={() => handleAutoDeploy()}
                 disabled={autoDeploying || !newSymbol.trim()}>
                 {autoDeploying ? 'Analyzing…' : 'Auto-deploy'}
