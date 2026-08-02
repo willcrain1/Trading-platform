@@ -421,10 +421,10 @@ If triggered, the position is closed immediately at the current quote through **
 
 ```mermaid
 flowchart LR
-    E[engine.py / exits.py] -->|get_active_broker(portfolio_id)| REG{"_paper_brokers registry\n{portfolio_id: PaperBroker}"}
-    REG -->|lazy-create if missing| SB2[PaperBroker\nsmart_buy]
-    REG -->|lazy-create if missing| TS2[PaperBroker\ntechnical_sustained]
-    REG -->|lazy-create if missing| CR2[PaperBroker\ncrypto]
+    E["engine.py / exits.py"] -->|"get_active_broker portfolio_id"| REG["_paper_brokers registry\nkeyed by portfolio_id"]
+    REG -->|"lazy-create if missing"| SB2["PaperBroker\nsmart_buy"]
+    REG -->|"lazy-create if missing"| TS2["PaperBroker\ntechnical_sustained"]
+    REG -->|"lazy-create if missing"| CR2["PaperBroker\ncrypto"]
 ```
 
 - One `PaperBroker(portfolio_id)` instance per portfolio, held in a module-level registry (`get_paper_broker(portfolio_id)`, lazy-created and cached; `get_active_broker(portfolio_id)` is the entry point everything calls, transparently swapping to a real broker if one's ever configured — Alpaca, if used, stays a single non-portfolio-scoped broker since a real brokerage account doesn't naturally split into virtual sub-ledgers).
